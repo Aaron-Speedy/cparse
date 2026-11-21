@@ -1,0 +1,51 @@
+var g
+  decl  2:5
+  def   2:5
+  write 9:5
+  read  17:12
+var h
+  decl  2:8
+  def   2:8
+  rw    10:5
+  noeval 18:18
+var k
+  decl  2:11
+  def   2:11
+  rw    11:5
+  read  20:24
+var m
+  decl  2:14
+  def   2:14
+  addr  12:15
+var arr
+  decl  2:17
+  def   2:17
+  write 13:5
+var ptr
+  decl  2:26
+  def   2:26
+  read  14:6
+var s
+  decl  3:21
+  def   3:21
+  write 15:5
+var fp
+  decl  5:8
+  def   5:8
+  call  16:5
+func callee
+  decl  4:6
+  read  5:19
+  call  17:5
+func helper
+  decl  6:12
+  def   6:1
+  noeval 19:18
+  call  20:17
+func use
+  decl  7:5
+  def   7:1
+  call  22:25
+use -> callee
+use -> helper
+main -> use
