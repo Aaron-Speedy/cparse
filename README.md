@@ -16,7 +16,7 @@ what is covered.
 It's written in C99. It uses arenas instead of malloc, does no I/O, and
 needs nothing from libc except `setjmp`.
 
-The full API is documented in comments in `cparse.h`.
+The full API is documented at the top of `cparse.h`.
 
 WIP! There still may be bugs! If you find any, or have any ideas or suggestions,
 feel free to contact me at my email (aaronspeedy@protonmail.com) or through
