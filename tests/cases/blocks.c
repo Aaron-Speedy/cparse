@@ -10,3 +10,10 @@ int use(void)
     return apply(twice, 4);
 }
 int *_Nonnull nn(int *_Nullable p);
+void blockforms(void)
+{
+    void (^a)(void) = ^() { };
+    void (^b)(void) = ^__attribute__((aligned(8))) { };
+    int (^c)(int) = ^ int (int v) { return v; };
+    int (^d)(void) = ^ int { return 1; };
+}

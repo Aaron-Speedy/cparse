@@ -495,6 +495,13 @@ enum {  // type flags
     CP_TF_PACKED     = 1<<10, // semantic: packed struct
     CP_TF_FLEX       = 1<<11, // semantic: struct ends in a flexible array
     CP_TF_SDCCBIT    = 1<<12, // _Bool spelled __bit (SDCC bit storage)
+    CP_TF_NORETURN   = 1<<13, // semantic function type reached through a
+                              //   noreturn pointer: GCC makes it a variant
+                              //   type C cannot spell (Clang does not)
+    CP_TF_PROTOTAG   = 1<<14, // semantic tag first declared in a parameter
+                              //   list: no code outside can name it
+    CP_TF_ABI        = 1<<15, // semantic function type with ms_abi or
+                              //   sysv_abi, which GCC keeps in the type
 };
 
 struct cp_type {
@@ -541,6 +548,9 @@ struct cp_attr {
     int32_t  kind;
     int32_t  before;  // appeared before a pointer's * rather than after
     int32_t  aftertype;  // in specifiers, came after the type: int WINAPI
+    int32_t  aftername;  // right after a declarator's name: f [[x]] (int)
+    int32_t  afterwidth;  // after a bit-field's width: int x : 3 PACKED
+    int32_t  leading;  // an annotation macro before the type
     int32_t  beg;
     int32_t  end;
 };
@@ -586,6 +596,10 @@ struct cp_config {
                             //   than line markers and #pragma
     int32_t   trigraphs;    // translate ??= ??/ and the rest, as ISO C
                             //   before C23 requires (cc -std=c99)
+    int64_t   time;         // seconds since 1970 for __DATE__, __TIME__
+                            //   and __TIMESTAMP__, shown as UTC (add the
+                            //   zone offset for local time); 0 means
+                            //   2000-01-01, for reproducible output
 };
 
 struct cp_unit {
@@ -653,6 +667,161 @@ cp_str cp_typename(cp_arena *, cp_unit *, cp_type *);
 cp_str cp_nodename(int32_t kind);
 cp_str cp_tokname(int32_t kind);
 
+// ---- Convenience
+//
+// Short answers to common questions. None of these allocate unless given
+// an arena, and all accept null where a node, symbol or type may be
+// missing. A few examples:
+//
+//     // every function defined in the main file, with its signature
+//     for (cp_sym *f = 0; (f = cp_nextsym(u, f, CP_KIND(CP_SYM_FUNC), CP_SEL_MAIN|CP_SEL_DEFINED));)
+//         printf("%s\n", cp_signature(&a, u, f).data);
+//
+//     // every call to malloc, with its location and argument
+//     for (cp_symref *r = cp_callsto(u, CP_STR("malloc")); r; r = r->next)
+//         printf("%s: %s\n", cp_locstr(&a, u, r->node).data,
+//                cp_nodestr(&a, u, r->node->list).data);
+//
+//     // a struct's fields with offsets (anonymous members flattened)
+//     cp_field *f;
+//     int32_t n = cp_fields(&a, cp_findtag(u, CP_STR("point"))->ty, &f);
+//
+// Strings returned in an arena are also null-terminated, so .data can be
+// handed to printf.
+
+// Where a node starts: file, line and byte column (1-based). For code
+// that came out of a macro, the place the macro was invoked.
+typedef struct { cp_str file; int32_t line, col; } cp_loc;
+cp_loc cp_locof(cp_unit *, cp_node *);
+cp_str cp_locstr(cp_arena *, cp_unit *, cp_node *);  // "file.c:12:5"
+
+// The source text a node spans, exactly as written; a null string when it
+// does not lie in one stretch of one file (it came from a macro).
+cp_str cp_srcof(cp_unit *, cp_node *);
+
+// The comment block directly before a node (its doc comment), if any.
+cp_str cp_docof(cp_unit *, cp_node *);
+
+// The same for a symbol's first declaration, tags included (which have
+// no declaration node).
+cp_loc cp_symloc(cp_unit *, cp_sym *);
+cp_str cp_symdoc(cp_unit *, cp_sym *);
+
+// Whether a node lies in the main file rather than a header, and the
+// outermost macro that produced it (null if written directly).
+int32_t   cp_inmainfile(cp_unit *, cp_node *);
+cp_macro *cp_macroof(cp_unit *, cp_node *);
+
+// A node regenerated as C: an expression, statement or declaration.
+cp_str cp_nodestr(cp_arena *, cp_unit *, cp_node *);
+
+// File-scope entities by name: variables, functions, typedefs and
+// enumeration constants; tags (struct, union, enum); macro definitions
+// (the last one seen).
+cp_sym   *cp_findsym(cp_unit *, cp_str name);
+cp_sym   *cp_findtag(cp_unit *, cp_str name);
+cp_macro *cp_macrodef(cp_unit *, cp_str name);
+
+// Step through the symbols after prev (from the first when prev is null)
+// whose kind is in kinds (a mask of CP_KIND(CP_SYM_*), 0 for all) and that
+// pass every CP_SEL_* in sel. Null at the end.
+#define CP_KIND(k) (1 << (k))
+enum {
+    CP_SEL_MAIN     = 1<<0,  // declared in the main file
+    CP_SEL_DEFINED  = 1<<1,  // has a definition
+    CP_SEL_FILE     = 1<<2,  // at file scope
+    CP_SEL_EXTERNAL = 1<<3,  // external linkage
+    CP_SEL_USED     = 1<<4,  // used at least once
+};
+cp_sym *cp_nextsym(cp_unit *, cp_sym *prev, int32_t kinds, int32_t sel);
+
+// A declaration of name with type t, as C: cp_declstr(a, u, t, "fp") gives
+// "int (*fp)(char *)". A function symbol's declaration as written, with
+// its parameter names: "static int add(int x, int y)".
+cp_str cp_declstr(cp_arena *, cp_unit *, cp_type *, cp_str name);
+cp_str cp_signature(cp_arena *, cp_unit *, cp_sym *func);
+
+// The named fields of a struct or union, anonymous members flattened into
+// their parent, with offsets from the start of t. Returns the count and
+// points *out at an array in the arena; -1 if the arena runs out.
+typedef struct {
+    cp_str   name;
+    cp_type *type;
+    int64_t  offset;     // bytes
+    int64_t  bitoffset;  // bits, for bit-fields
+    int32_t  bitwidth;   // -1 if not a bit-field
+    cp_node *decl;       // the declarator
+} cp_field;
+int32_t cp_fields(cp_arena *, cp_type *, cp_field **out);
+
+// The constants of an enum type, in order.
+typedef struct { cp_str name; int64_t value; cp_node *decl; } cp_enumconst;
+int32_t cp_enumconsts(cp_arena *, cp_type *, cp_enumconst **out);
+
+// Visit every node under root, parents before children. The visitor
+// returns 1 to go into the node's children, 0 to skip them, -1 to stop.
+typedef int32_t (*cp_visitor)(void *ctx, cp_node *node, cp_node *parent);
+void cp_walk(cp_node *root, cp_visitor, void *ctx);
+void cp_walkunit(cp_unit *, cp_visitor, void *ctx);
+
+// The function a call expression calls directly (null for calls through
+// pointers), and every direct call of the named function: a list whose
+// node is the call expression and sym the calling function.
+cp_sym    *cp_callee(cp_node *call);
+cp_symref *cp_callsto(cp_unit *, cp_str name);
+
+// Type questions. cp_typeis is true when t has all the properties in
+// what: cp_typeis(t, CP_IS_INTEGER|CP_IS_UNSIGNED). cp_strip gives the
+// canonical type without typedefs or qualifiers; cp_target what a pointer
+// points to, an array or vector holds, or a function returns.
+enum {
+    CP_IS_VOID     = 1<<0,  CP_IS_INTEGER  = 1<<1,  CP_IS_FLOATING = 1<<2,
+    CP_IS_ARITH    = 1<<3,  CP_IS_SCALAR   = 1<<4,  CP_IS_POINTER  = 1<<5,
+    CP_IS_ARRAY    = 1<<6,  CP_IS_FUNC     = 1<<7,  CP_IS_STRUCT   = 1<<8,
+    CP_IS_UNION    = 1<<9,  CP_IS_RECORD   = 1<<10, CP_IS_ENUM     = 1<<11,
+    CP_IS_SIGNED   = 1<<12, CP_IS_UNSIGNED = 1<<13, CP_IS_CONST    = 1<<14,
+    CP_IS_VOLATILE = 1<<15, CP_IS_COMPLETE = 1<<16, CP_IS_VECTOR   = 1<<17,
+    CP_IS_VARIADIC = 1<<18, CP_IS_BOOL     = 1<<19,
+};
+int32_t  cp_typeis(cp_type *, int32_t what);
+cp_type *cp_strip(cp_type *);
+cp_type *cp_target(cp_type *);
+
+// The value of an integer constant expression; false if e is not one.
+int32_t cp_constint(cp_node *e, int64_t *value);
+
+// A diagnostic as a compiler prints it: "file.c:3:7: error: message".
+cp_str cp_errorstr(cp_arena *, cp_error *);
+
+#ifdef CPARSE_HOSTED
+// ---- Hosted helpers (define CPARSE_HOSTED with CPARSE_IMPLEMENTATION)
+//
+// These do I/O, through the C library and POSIX popen, so the core above
+// stays free of it. They make parsing a file as a compiler would a single
+// call:
+//
+//     cp_arena a = cp_newarena((ptrdiff_t)1 << 30);
+//     cp_unit *u = cp_parsefile(&a, "main.c", argc-1, argv+1);
+//
+// args are compiler-style options: -I, -isystem, -iquote, -D, -U,
+// -include, -std=, -O, -m, -f, -trigraphs, -nostdinc, plus --cc CC (the
+// compiler asked for predefined macros and include directories; "none" to
+// skip) and --target lp64|llp64|ilp32. Unknown options are ignored.
+
+// An arena of cap bytes from malloc; a null arena on failure.
+cp_arena cp_newarena(ptrdiff_t cap);
+
+// A configuration from compiler-style options, as described above.
+cp_config *cp_hostconfig(cp_arena *, int argc, char **argv);
+
+// Read and parse a file. Null if it cannot be read or the arena is full.
+cp_unit *cp_parsefile(cp_arena *, char const *path, int argc, char **argv);
+
+// Read a whole file into the arena (null-terminated); a null string if
+// it cannot be read. Usable as cp_config.readfile.
+cp_str cp_readfile(void *ctx, cp_str path, cp_arena *);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
@@ -663,6 +832,11 @@ cp_str cp_tokname(int32_t kind);
 // ======================================================================
 #ifdef CPARSE_IMPLEMENTATION
 #include <setjmp.h>
+#ifdef CPARSE_HOSTED
+#  include <stdio.h>
+#  include <stdlib.h>
+#  include <time.h>
+#endif
 
 // Short names for the implementation only; undefined again at the end.
 #define i8  int8_t
@@ -894,6 +1068,16 @@ static const cp_kwdef cp_keywords[] = {
     {"_Null_unspecified", CP_K_KWATTR}, {"_Nullable_result", CP_K_KWATTR},
     {"__nonnull", CP_K_KWATTR}, {"__nullable", CP_K_KWATTR},
     {"__null_unspecified", CP_K_KWATTR}, {"__seg_fs", CP_K_KWATTR}, {"__seg_gs", CP_K_KWATTR},
+    {"__based", CP_K_KWATTRARGS},
+    {"__ptrauth", CP_K_KWATTRARGS}, {"__address_space", CP_K_KWATTRARGS},
+};
+
+// Embedded compilers' words (Keil, IAR, SDCC, z88dk). GCC and Clang have
+// none of them, and code they compile uses some as names ("} __packed;"
+// with no such macro declares a variable), so these are keywords only
+// when the compiler is not GCC-like. Elsewhere an unknown one is still
+// read as an annotation, as for any missing macro.
+static const cp_kwdef cp_embeddedkeywords[] = {
     {"__far", CP_K_KWATTR}, {"_far", CP_K_KWATTR},
     {"__near", CP_K_KWATTR}, {"_near", CP_K_KWATTR},
     {"__huge", CP_K_KWATTR}, {"_huge", CP_K_KWATTR},
@@ -903,8 +1087,6 @@ static const cp_kwdef cp_keywords[] = {
     {"__sfr32", CP_K_KWATTR}, {"__sbit", CP_K_KWATTR},
     {"__no_init", CP_K_KWATTR}, {"__ramfunc", CP_K_KWATTR},
     {"__at", CP_K_KWATTRARGS}, {"__interrupt", CP_K_KWATTRARGS},
-    {"__based", CP_K_KWATTRARGS},
-    {"__ptrauth", CP_K_KWATTRARGS}, {"__address_space", CP_K_KWATTRARGS},
     // SDCC (8051, Z80, STM8, PIC): storage classes and function qualifiers
     {"__idata", CP_K_KWATTR}, {"__pdata", CP_K_KWATTR}, {"__eeprom", CP_K_KWATTR},
     {"__reentrant", CP_K_KWATTR}, {"__naked", CP_K_KWATTR}, {"__critical", CP_K_KWATTR},
@@ -949,6 +1131,7 @@ struct cp_pptok {
     cp_hideset *hs;
     cp_str      doc;
     i32         noexpand; // painted blue: never expand again
+    i32         lmline, lmfile;  // CP_PP_LINE: the line and file it names
 };
 
 typedef struct {
@@ -956,26 +1139,36 @@ typedef struct {
     i32    kind;
 } cp_punct;
 
-// Longest first within each leading character.
+// Longest first within each leading character. (CP_P, not S(): a
+// compound literal is not a constant initializer in strict C99.)
+#define CP_P(s) {s, sizeof(s)-1}
 static const cp_punct cp_puncts[] = {
-    {S("%:%:"), CP_HASHHASH}, {S("..."), CP_ELLIPSIS}, {S("<<="), CP_SHLEQ},
-    {S(">>="), CP_SHREQ}, {S("->"), CP_ARROW}, {S("++"), CP_INC},
-    {S("--"), CP_DEC}, {S("<<"), CP_SHL}, {S(">>"), CP_SHR},
-    {S("<="), CP_LE}, {S(">="), CP_GE}, {S("=="), CP_EQ}, {S("!="), CP_NE},
-    {S("&&"), CP_ANDAND}, {S("||"), CP_OROR}, {S("*="), CP_MULEQ},
-    {S("/="), CP_DIVEQ}, {S("%="), CP_MODEQ}, {S("+="), CP_ADDEQ},
-    {S("-="), CP_SUBEQ}, {S("&="), CP_ANDEQ}, {S("^="), CP_XOREQ},
-    {S("|="), CP_OREQ}, {S("##"), CP_HASHHASH}, {S("<:"), CP_LBRACK},
-    {S(":>"), CP_RBRACK}, {S("<%"), CP_LBRACE}, {S("%>"), CP_RBRACE},
-    {S("%:"), CP_HASH}, {S("["), CP_LBRACK}, {S("]"), CP_RBRACK},
-    {S("("), CP_LPAREN}, {S(")"), CP_RPAREN}, {S("{"), CP_LBRACE},
-    {S("}"), CP_RBRACE}, {S("."), CP_DOT}, {S("&"), CP_AMP},
-    {S("*"), CP_STAR}, {S("+"), CP_PLUS}, {S("-"), CP_MINUS},
-    {S("~"), CP_TILDE}, {S("!"), CP_NOT}, {S("/"), CP_SLASH},
-    {S("%"), CP_PERCENT}, {S("<"), CP_LT}, {S(">"), CP_GT},
-    {S("^"), CP_XOR}, {S("|"), CP_OR}, {S("?"), CP_QUESTION},
-    {S(":"), CP_COLON}, {S(";"), CP_SEMI}, {S("="), CP_ASSIGN},
-    {S(","), CP_COMMA}, {S("#"), CP_HASH},
+    {CP_P("%:%:"), CP_HASHHASH}, {CP_P("..."), CP_ELLIPSIS},
+    {CP_P("<<="), CP_SHLEQ}, {CP_P(">>="), CP_SHREQ}, {CP_P("->"), CP_ARROW},
+    {CP_P("++"), CP_INC}, {CP_P("--"), CP_DEC}, {CP_P("<<"), CP_SHL},
+    {CP_P(">>"), CP_SHR}, {CP_P("<="), CP_LE}, {CP_P(">="), CP_GE},
+    {CP_P("=="), CP_EQ}, {CP_P("!="), CP_NE}, {CP_P("&&"), CP_ANDAND},
+    {CP_P("||"), CP_OROR}, {CP_P("*="), CP_MULEQ}, {CP_P("/="), CP_DIVEQ},
+    {CP_P("%="), CP_MODEQ}, {CP_P("+="), CP_ADDEQ}, {CP_P("-="), CP_SUBEQ},
+    {CP_P("&="), CP_ANDEQ}, {CP_P("^="), CP_XOREQ}, {CP_P("|="), CP_OREQ},
+    {CP_P("##"), CP_HASHHASH}, {CP_P("<:"), CP_LBRACK},
+    {CP_P(":>"), CP_RBRACK}, {CP_P("<%"), CP_LBRACE}, {CP_P("%>"), CP_RBRACE},
+    {CP_P("%:"), CP_HASH}, {CP_P("["), CP_LBRACK}, {CP_P("]"), CP_RBRACK},
+    {CP_P("("), CP_LPAREN}, {CP_P(")"), CP_RPAREN}, {CP_P("{"), CP_LBRACE},
+    {CP_P("}"), CP_RBRACE}, {CP_P("."), CP_DOT}, {CP_P("&"), CP_AMP},
+    {CP_P("*"), CP_STAR}, {CP_P("+"), CP_PLUS}, {CP_P("-"), CP_MINUS},
+    {CP_P("~"), CP_TILDE}, {CP_P("!"), CP_NOT}, {CP_P("/"), CP_SLASH},
+    {CP_P("%"), CP_PERCENT}, {CP_P("<"), CP_LT}, {CP_P(">"), CP_GT},
+    {CP_P("^"), CP_XOR}, {CP_P("|"), CP_OR}, {CP_P("?"), CP_QUESTION},
+    {CP_P(":"), CP_COLON}, {CP_P(";"), CP_SEMI}, {CP_P("="), CP_ASSIGN},
+    {CP_P(","), CP_COMMA}, {CP_P("#"), CP_HASH},
+};
+#undef CP_P
+
+// Token kinds only the preprocessor sees.
+enum {
+    CP_PP_FILEEND = CP_NTOKKINDS + 1,
+    CP_PP_LINE,  // a line marker or #line, applied only if not skipped
 };
 
 typedef struct {
@@ -1010,6 +1203,17 @@ static char *cp_scanquote(char *s, char *e)
 // Lex a whole file into a linked list of tokens ending in CP_EOF.
 // Backslash-newline is treated as whitespace between tokens and spliced
 // out of identifiers; it is rare enough elsewhere to ignore.
+// Past any line splices (backslash-newline) at p: in the token text they
+// are still there, but they are no part of the literal.
+static char *cp_skipsplices(char *p, char *e)
+{
+    for (;;) {
+        if (p+1 < e && p[0] == '\\' && p[1] == '\n') p += 2;
+        else if (p+2 < e && p[0] == '\\' && p[1] == '\r' && p[2] == '\n') p += 3;
+        else return p;
+    }
+}
+
 static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
 {
     cp_mem *m = ls->mem;
@@ -1040,7 +1244,7 @@ static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
                 s += s[1]=='\r' ? 3 : 2;
                 line++; linestart = s;
                 flags |= CP_TF_SPACE;
-            } else if (c=='/' && s+1<e && s[1]=='/') {
+            } else if (c=='/' && cp_skipsplices(s+1, e) < e && *cp_skipsplices(s+1, e)=='/') {
                 char *beg = s;
                 i32 bline = line, bcol = (i32)(s - linestart) + 1;
                 while (s < e && *s != '\n') {
@@ -1064,15 +1268,28 @@ static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
                     *ls->ctail = n; ls->ctail = &n->next; ls->ncomments++;
                 }
                 flags |= CP_TF_SPACE;
-            } else if (c=='/' && s+1<e && s[1]=='*') {
+            } else if (c=='/' && cp_skipsplices(s+1, e) < e && *cp_skipsplices(s+1, e)=='*') {
+                // the delimiters may be split by line splices: "/\<newline>*"
                 char *beg = s;
                 i32 bline = line, bcol = (i32)(s - linestart) + 1;
-                s += 2;
-                while (s < e && !(*s=='*' && s+1<e && s[1]=='/')) {
+                char *open = cp_skipsplices(s+1, e) + 1;
+                for (; s < open; s++) {
+                    if (*s == '\n') { line++; linestart = s+1; }
+                }
+                for (;;) {
+                    if (s >= e) break;
+                    if (*s == '*') {
+                        char *q = cp_skipsplices(s+1, e);
+                        if (q < e && *q == '/') {
+                            for (; s <= q; s++) {
+                                if (*s == '\n') { line++; linestart = s+1; }
+                            }
+                            break;
+                        }
+                    }
                     if (*s == '\n') { line++; linestart = s+1; }
                     s++;
                 }
-                s = s+2 <= e ? s+2 : e;
                 cp_str text = cp_span(beg, s);
                 if (!(flags & CP_TF_BOL)) {
                     doc.data = 0; doc.len = 0; docend = -1;  // trailing
@@ -1095,8 +1312,9 @@ static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
             }
         }
 
-        // Line markers ("# 12 "file" 1 3") and #line are positional
-        // bookkeeping and are applied right here.
+        // Line markers ("# 12 "file" 1 3") and #line become a CP_PP_LINE
+        // token; the preprocessor applies it unless it lies in a skipped
+        // group (an amalgamation's "#ifdef LINES / #line 1 "x.c" / #endif").
         if ((flags & CP_TF_BOL) && s < e && *s == '#' && ls->internfile) {
             char *q = s + 1;
             while (q < e && (*q==' ' || *q=='\t')) q++;
@@ -1111,16 +1329,26 @@ static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
                     n = n < 1<<28 ? n*10 + (*q - '0') : n;
                 }
                 while (q < e && (*q==' ' || *q=='\t')) q++;
+                i32 lmfile = -1;
                 if (q < e && *q == '"') {
                     char *ne = cp_scanquote(q, e);
                     if (ne) {
-                        file = ls->internfile(ls->ctx, cp_span(q+1, ne-1));
+                        lmfile = ls->internfile(ls->ctx, cp_span(q+1, ne-1));
                         q = ne;
                     }
                 }
                 while (q < e && *q != '\n') q++;
+                cp_pptok *lm = cp_new(m, 1, cp_pptok);
+                lm->kind = CP_PP_LINE;
+                lm->flags = CP_TF_BOL;
+                lm->line = line;
+                lm->col = (i32)(s - linestart) + 1;
+                lm->file = file;
+                lm->text = cp_span(s, q);
+                lm->lmline = (i32)n;
+                lm->lmfile = lmfile;
+                tail = tail->next = lm;
                 s = q;
-                line = (i32)n - 1;  // the newline brings it to n
                 doc.data = 0; doc.len = 0; docend = -1;
                 continue;
             }
@@ -1213,6 +1441,8 @@ static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
                     s++;
                 } else if (d=='\'' && s+1<e && cp_isident((u8)s[1]) && cp_isxdigit((u8)s[-1])) {
                     s++;
+                } else if (d=='\\' && s+1<e && s[1]=='\n') {
+                    s += 2;  // a splice inside the number, removed below
                 } else {
                     break;
                 }
@@ -1254,11 +1484,25 @@ static cp_pptok *cp_lexfile(cp_lexstate *ls, cp_str src, i32 file)
             }
         }
         t->text = cp_span(beg, s);
+        b32 spliced = 0;
         for (char *q = beg; q < s; q++) {
             if (*q == '\n') {  // spliced lines inside the token
                 line++;
                 linestart = q + 1;
+                spliced = 1;
             }
+        }
+        if (spliced && (t->kind == CP_IDENT || t->kind == CP_INTLIT || t->kind == CP_FLOATLIT)) {
+            // a name or number is spelled without its line splices:
+            // "#define NAME\" defines NAME
+            char *buf = cp_new(ls->mem, s - beg, char);
+            iz n = 0;
+            for (char *q = beg; q < s; q++) {
+                if (q+1 < s && q[0] == '\\' && q[1] == '\n') { q++; continue; }
+                if (q+2 < s && q[0] == '\\' && q[1] == '\r' && q[2] == '\n') { q += 2; continue; }
+                buf[n++] = *q;
+            }
+            t->text = cp_span(buf, buf+n);
         }
     }
 }
@@ -1294,7 +1538,6 @@ static void cp_diag(cp_diags *d, b32 warning, i32 tok, i32 file, i32 line, i32 c
 // ----------------------------------------------------------------------
 // Preprocessor (Prosser's algorithm with hidesets, as in chibicc)
 
-enum { CP_PP_FILEEND = CP_NTOKKINDS + 1 };
 
 typedef struct cp_ppmacro cp_ppmacro;
 struct cp_ppmacro {
@@ -1337,7 +1580,10 @@ typedef struct {
     cp_diags    *diags;
     cp_map      *kw;
     cp_map      *macros;   // name -> cp_ppmacro (val null when undefined)
-    cp_map      *once;
+    cp_map      *once;     // normalized paths not to enter again
+    cp_map      *entered;  // normalized paths entered at least once
+    i32         *oncefiles;  // files marked once, for the content check
+    i32          nonce, caponce;
     cp_map      *guards;   // path -> guard macro name
     cp_map      *filemap;  // path -> 1 + file index
     cp_map      *pushed;   // name -> cp_macrostack
@@ -1345,6 +1591,9 @@ typedef struct {
     cp_lexstate  ls;
     cp_file     *files;
     i32         *filedir;  // search directory index each file was found in
+    struct cp_linemap { i32 on, phys, line, file; } *lmap;  // per file:
+    i32          caplmap;  // after physical line phys, line numbers run
+                           // from line in file (the last #line applied)
     i32          nfiles, capfiles;
     cp_macro    *mhead, *mtail;
     cp_cond     *cond;
@@ -1353,6 +1602,8 @@ typedef struct {
     i32          inargs;   // > 0 while pre-expanding macro arguments
     b32          predefs;  // processing cp_config.predefs
     b32          inif;     // expanding a #if line
+    b32          nopp;     // input already preprocessed (cp_config.nopp)
+    b32          noinclude;  // reading predefs for preprocessed input
     // output
     cp_pptok    *outhead, *outtail;
     i32          nout;
@@ -1375,6 +1626,23 @@ static void cp_listpush(cp_mem *m, cp_listnode ***tail, i32 *count, void *item)
 
 // Translation phase 1: replace trigraphs. The copy is made only when
 // there is something to replace, so columns stay exact in ordinary files.
+// A lone carriage return ends a line, as in old Mac files and as GCC
+// counts it. Each becomes "\n", which keeps every offset; the copy is
+// made only if there is one.
+static cp_str cp_lonecr(cp_mem *perm, cp_str src)
+{
+    char *buf = 0;
+    for (iz i = 0; i < src.len; i++) {
+        if (src.data[i] != '\r' || (i+1 < src.len && src.data[i+1] == '\n')) continue;
+        if (!buf) {
+            buf = cp_new(perm, src.len, char);
+            cp_memcpy(buf, src.data, src.len);
+        }
+        buf[i] = '\n';
+    }
+    return buf ? cp_span(buf, buf+src.len) : src;
+}
+
 static cp_str cp_trigraphs(cp_mem *m, cp_str src)
 {
     static const char from[] = "=/'()!<>-", to[] = "#\\^[]|{}~";
@@ -1406,6 +1674,7 @@ static cp_str cp_trigraphs(cp_mem *m, cp_str src)
 static i32 cp_addfile(cp_pp *pp, cp_str path, cp_str src, i32 dir, b32 sys)
 {
     if (pp->cfg && pp->cfg->trigraphs) src = cp_trigraphs(pp->mem, src);
+    src = cp_lonecr(pp->mem, src);
     if (pp->nfiles == pp->capfiles) {
         i32 cap = pp->capfiles ? pp->capfiles*2 : 16;
         cp_file *f = cp_new(pp->mem, cap, cp_file);
@@ -1452,9 +1721,42 @@ static cp_str cp_cstr(char *s)
     return r;
 }
 
+// Where a token is, after any #line that applies to its file.
+static void cp_mappos(cp_pp *pp, i32 *file, i32 *line)
+{
+    i32 f = *file;
+    if (f < 0 || f >= pp->caplmap || !pp->lmap[f].on) return;
+    struct cp_linemap *m = &pp->lmap[f];
+    *line = m->line + (*line - m->phys - 1);
+    *file = m->file;
+}
+
+// Apply a line marker or #line in the code being processed.
+static void cp_setline(cp_pp *pp, cp_pptok *t)
+{
+    i32 f = t->file;
+    if (f < 0) return;
+    if (f >= pp->caplmap) {
+        i32 cap = pp->caplmap ? pp->caplmap : 16;
+        while (cap <= f) cap *= 2;
+        struct cp_linemap *n = cp_new(pp->mem, cap, struct cp_linemap);
+        if (pp->caplmap) cp_memcpy(n, pp->lmap, pp->caplmap*(iz)sizeof(*n));
+        pp->lmap = n;
+        pp->caplmap = cap;
+    }
+    struct cp_linemap *m = &pp->lmap[f];
+    i32 curfile = m->on ? m->file : f;
+    m->on = 1;
+    m->phys = t->line;
+    m->line = t->lmline;
+    m->file = t->lmfile >= 0 ? t->lmfile : curfile;
+}
+
 static void cp_pperror(cp_pp *pp, cp_pptok *t, b32 warning, cp_str msg)
 {
-    cp_diag(pp->diags, warning, -1, t->file, t->line, t->col, msg);
+    i32 file = t->file, line = t->line;
+    cp_mappos(pp, &file, &line);
+    cp_diag(pp->diags, warning, -1, file, line, t->col, msg);
 }
 
 static cp_pptok *cp_copytok(cp_pp *pp, cp_pptok *t)
@@ -2083,6 +2385,62 @@ static void cp_markorigin(cp_pp *pp, cp_pptok *list, cp_pptok *name, cp_ppmacro 
     }
 }
 
+// __DATE__ "Mmm dd yyyy", __TIME__ "hh:mm:ss" and __TIMESTAMP__ "Www Mmm dd
+// hh:mm:ss yyyy" for the configured time, in UTC. (GCC's __TIMESTAMP__ is
+// the file's modification time, which a library without I/O cannot know.)
+static cp_str cp_datestr(cp_pp *pp, i32 kind)
+{
+    i64 t = pp->cfg && pp->cfg->time ? pp->cfg->time : 946684800;  // 2000-01-01
+    i64 days = t / 86400, secs = t % 86400;
+    if (secs < 0) { secs += 86400; days--; }
+    i32 wday = (i32)(((days + 4) % 7 + 7) % 7);  // 1970-01-01 was a Thursday
+    // civil date from a day count (Howard Hinnant's algorithm)
+    i64 z = days + 719468;
+    i64 era = (z >= 0 ? z : z - 146096) / 146097;
+    i64 doe = z - era*146097;
+    i64 yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    i64 doy = doe - (365*yoe + yoe/4 - yoe/100);
+    i64 mp = (5*doy + 2) / 153;
+    i32 day = (i32)(doy - (153*mp + 2)/5 + 1);
+    i32 mon = (i32)(mp < 10 ? mp + 3 : mp - 9);
+    i64 year = yoe + era*400 + (mon <= 2);
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    static const char wdays[] = "SunMonTueWedThuFriSat";
+    char buf[32];
+    i32 n = 0;
+    #define CP_D2(v) (buf[n++] = (char)('0' + (v)/10), buf[n++] = (char)('0' + (v)%10))
+    buf[n++] = '"';
+    if (kind == CP_BI_TIMESTAMP) {
+        for (i32 i = 0; i < 3; i++) buf[n++] = wdays[wday*3+i];
+        buf[n++] = ' ';
+    }
+    if (kind != CP_BI_TIME) {
+        for (i32 i = 0; i < 3; i++) buf[n++] = months[(mon-1)*3+i];
+        buf[n++] = ' ';
+        buf[n++] = (char)(day < 10 ? ' ' : '0' + day/10);
+        buf[n++] = (char)('0' + day%10);
+        buf[n++] = ' ';
+    }
+    if (kind != CP_BI_DATE) {
+        CP_D2((i32)(secs/3600));
+        buf[n++] = ':';
+        CP_D2((i32)(secs/60%60));
+        buf[n++] = ':';
+        CP_D2((i32)(secs%60));
+        if (kind == CP_BI_TIMESTAMP) buf[n++] = ' ';
+    }
+    if (kind != CP_BI_TIME) {
+        i32 y = (i32)(year < 0 ? 0 : year > 9999 ? 9999 : year);
+        CP_D2(y/100);
+        CP_D2(y%100);
+    }
+    #undef CP_D2
+    buf[n++] = '"';
+    char *r = cp_new(pp->mem, n, char);
+    cp_memcpy(r, buf, n);
+    return cp_span(r, r+n);
+}
+
 static b32 cp_expand(cp_pp *pp, cp_pptok **rest, cp_pptok *tok)
 {
     if (tok->kind != CP_IDENT || tok->noexpand) return 0;
@@ -2099,14 +2457,17 @@ static b32 cp_expand(cp_pp *pp, cp_pptok **rest, cp_pptok *tok)
         case CP_BI_FILE:
         case CP_BI_FILE_NAME:
         case CP_BI_BASE_FILE: {
-            i32 f = m->builtin == CP_BI_BASE_FILE ? 0 : tok->file;
+            i32 f = m->builtin == CP_BI_BASE_FILE ? 0 : tok->file, l = tok->line;
+            if (m->builtin != CP_BI_BASE_FILE) cp_mappos(pp, &f, &l);
             cp_str path = f>=0 && f<pp->nfiles ? pp->files[f].path : S("");
             if (m->builtin == CP_BI_FILE_NAME) path = cp_basename(path);
             t = cp_newtok(pp, tok, CP_STRLIT, cp_quote(pp, path));
         } break;
-        case CP_BI_LINE:
-            t = cp_newtok(pp, tok, CP_INTLIT, cp_numstr(pp, tok->line));
-            break;
+        case CP_BI_LINE: {
+            i32 f = tok->file, l = tok->line;
+            cp_mappos(pp, &f, &l);
+            t = cp_newtok(pp, tok, CP_INTLIT, cp_numstr(pp, l));
+        } break;
         case CP_BI_COUNTER:
             t = cp_newtok(pp, tok, CP_INTLIT, cp_numstr(pp, pp->counter++));
             break;
@@ -2114,13 +2475,9 @@ static b32 cp_expand(cp_pp *pp, cp_pptok **rest, cp_pptok *tok)
             t = cp_newtok(pp, tok, CP_INTLIT, cp_numstr(pp, pp->depth > 0 ? pp->depth-1 : 0));
             break;
         case CP_BI_DATE:
-            t = cp_newtok(pp, tok, CP_STRLIT, S("\"Jan  1 2000\""));
-            break;
         case CP_BI_TIME:
-            t = cp_newtok(pp, tok, CP_STRLIT, S("\"00:00:00\""));
-            break;
         case CP_BI_TIMESTAMP:
-            t = cp_newtok(pp, tok, CP_STRLIT, S("\"Sat Jan  1 00:00:00 2000\""));
+            t = cp_newtok(pp, tok, CP_STRLIT, cp_datestr(pp, m->builtin));
             break;
         default:
             return 0;  // __has_include etc. outside #if
@@ -2566,9 +2923,16 @@ static void cp_doassert(cp_pp *pp, cp_pptok *t, b32 un)
     }
 }
 
-// Compiling for SDCC: make its words that elsewhere are names keywords.
+// Add the dialect keywords for the compiler: the embedded ones unless it
+// is GCC-like, and SDCC's words that elsewhere are names for SDCC.
 static void cp_sdcckw(cp_pp *pp, cp_map **kw)
 {
+    if (!cp_findmacro(pp, S("__GNUC__"))) {
+        for (iz i = 0; i < cp_countof(cp_embeddedkeywords); i++) {
+            cp_map *m = cp_upsert(kw, cp_cstr(cp_embeddedkeywords[i].name), pp->mem);
+            m->ival = cp_embeddedkeywords[i].kind;
+        }
+    }
     if (!cp_findmacro(pp, S("__SDCC")) && !cp_findmacro(pp, S("SDCC"))) return;
     for (iz i = 0; i < cp_countof(cp_sdcckeywords); i++) {
         cp_map *m = cp_upsert(kw, cp_cstr(cp_sdcckeywords[i].name), pp->mem);
@@ -2634,7 +2998,7 @@ static cp_pptok *cp_replacedefined(cp_pp *pp, cp_pptok *t, i32 curfile)
                 cp_str name;
                 b32 angled;
                 cp_pptok *r;
-                if (cp_headername(pp, arg, &r, &name, &angled, 0)) {
+                if (cp_headername(pp, arg, &r, &name, &angled, 1)) {  // __has_include(MACRO) too
                     cp_str path, src;
                     i32 dir;
                     b32 sys;
@@ -2782,6 +3146,8 @@ static cp_str cp_detectguard(cp_pptok *t)
         cp_str w = p->next->text;
         if (cp_equals(w, S("if")) || cp_equals(w, S("ifdef")) || cp_equals(w, S("ifndef"))) {
             depth++;
+        } else if (depth == 1 && (cp_equals(w, S("else")) || cp_startswith(w, S("elif")))) {
+            return none;  // gcc's limits.h re-enters for its #else branch
         } else if (cp_equals(w, S("endif"))) {
             if (--depth == 0) {
                 cp_pptok *after = cp_skipline(p->next);
@@ -2816,8 +3182,68 @@ static cp_pptok *cp_enterfile(cp_pp *pp, i32 file, cp_pptok *rest)
     return head.next;
 }
 
-static cp_pptok *cp_doinclude(cp_pp *pp, cp_pptok *hash, cp_pptok *t, b32 next)
+// A path with "./" and "dir/../" steps removed, so that one file reached
+// two ways is known as one (for #pragma once and #import).
+static cp_str cp_normpath(cp_pp *pp, cp_str path)
 {
+    // keep a stack of segments, then join them
+    cp_str *seg = cp_new(pp->mem, path.len/2 + 1, cp_str);
+    i32 n = 0;
+    b32 absolute = path.len && path.data[0] == '/';
+    for (iz i = 0; i < path.len;) {
+        iz e = i;
+        while (e < path.len && path.data[e] != '/') e++;
+        cp_str s = cp_span(path.data+i, path.data+e);
+        if (!s.len || cp_equals(s, S("."))) {
+            // nothing
+        } else if (cp_equals(s, S("..")) && n && !cp_equals(seg[n-1], S(".."))) {
+            n--;
+        } else if (!(cp_equals(s, S("..")) && absolute)) {
+            seg[n++] = s;
+        }
+        i = e + 1;
+    }
+    char *buf = cp_new(pp->mem, path.len+2, char);
+    iz len = 0;
+    if (absolute) buf[len++] = '/';
+    for (i32 k = 0; k < n; k++) {
+        if (k) buf[len++] = '/';
+        cp_memcpy(buf+len, seg[k].data, seg[k].len);
+        len += seg[k].len;
+    }
+    return cp_span(buf, buf+len);
+}
+
+// Mark a file never to be entered again (#pragma once, #import).
+static void cp_markonce(cp_pp *pp, i32 file)
+{
+    cp_upsert(&pp->once, cp_normpath(pp, pp->files[file].path), pp->mem);
+    if (pp->nonce == pp->caponce) {
+        i32 cap = pp->caponce ? pp->caponce*2 : 16;
+        i32 *n = cp_new(pp->mem, cap, i32);
+        if (pp->nonce) cp_memcpy(n, pp->oncefiles, pp->nonce*(iz)sizeof(i32));
+        pp->oncefiles = n;
+        pp->caponce = cap;
+    }
+    pp->oncefiles[pp->nonce++] = file;
+}
+
+// Is this file one marked once? By path, or else, as GCC does when it
+// cannot tell, by the same name and contents: "../dir/x.h" is "x.h".
+static b32 cp_isonce(cp_pp *pp, cp_str key, cp_str path, cp_str src)
+{
+    if (cp_upsert(&pp->once, key, 0)) return 1;
+    cp_str base = cp_basename(path);
+    for (i32 i = 0; i < pp->nonce; i++) {
+        cp_file *f = &pp->files[pp->oncefiles[i]];
+        if (cp_equals(cp_basename(f->path), base) && cp_equals(f->src, src)) return 1;
+    }
+    return 0;
+}
+
+static cp_pptok *cp_doinclude(cp_pp *pp, cp_pptok *hash, cp_pptok *t, b32 next, b32 import)
+{
+    if (pp->noinclude) return cp_skipline(t);  // preprocessed input has them
     cp_str name;
     b32 angled;
     cp_pptok *rest;
@@ -2860,10 +3286,13 @@ static cp_pptok *cp_doinclude(cp_pp *pp, cp_pptok *hash, cp_pptok *t, b32 next)
     pp->files[file].system = sys;
     inc->file = file;
 
-    if (cp_upsert(&pp->once, path, 0)) {
+    cp_str key = cp_normpath(pp, path);
+    if (cp_isonce(pp, key, path, src) || (import && cp_upsert(&pp->entered, key, 0))) {
         inc->skipped = 1;
         return rest;
     }
+    if (import) cp_markonce(pp, file);  // #import: at most once
+    cp_upsert(&pp->entered, key, pp->mem);
     cp_map *g = cp_upsert(&pp->guards, path, 0);
     if (g && g->val && cp_findmacro(pp, *(cp_str *)g->val)) {
         inc->skipped = 1;
@@ -3045,7 +3474,7 @@ static cp_pptok *cp_directive(cp_pp *pp, cp_pptok *hash)
     cp_str w = t->text;
     cp_pptok *arg = t->next;
 
-    if (pp->cfg && pp->cfg->nopp) {
+    if (pp->nopp) {
         if (cp_equals(w, S("pragma"))) {
             cp_addpragma(pp, hash, cp_linetext(arg), 0);
         }
@@ -3053,10 +3482,10 @@ static cp_pptok *cp_directive(cp_pp *pp, cp_pptok *hash)
     }
 
     if (cp_equals(w, S("include")) || cp_equals(w, S("import"))) {
-        return cp_doinclude(pp, hash, arg, 0);
+        return cp_doinclude(pp, hash, arg, 0, w.data[1] == 'm');
     }
     if (cp_equals(w, S("include_next"))) {
-        return cp_doinclude(pp, hash, arg, 1);
+        return cp_doinclude(pp, hash, arg, 1, 0);
     }
     if (cp_equals(w, S("define"))) {
         return cp_dodefine(pp, hash, arg);
@@ -3142,7 +3571,7 @@ static cp_pptok *cp_directive(cp_pp *pp, cp_pptok *hash)
     if (cp_equals(w, S("pragma"))) {
         cp_str text = cp_linetext(arg);
         if (arg->kind == CP_IDENT && cp_equals(arg->text, S("once"))) {
-            cp_upsert(&pp->once, pp->files[hash->file].path, pp->mem);
+            cp_markonce(pp, hash->file);
         } else if (arg->kind == CP_IDENT && (cp_equals(arg->text, S("push_macro")) ||
                    cp_equals(arg->text, S("pop_macro")))) {
             cp_pptok *s = arg->next->next;
@@ -3162,7 +3591,9 @@ static cp_pptok *cp_directive(cp_pp *pp, cp_pptok *hash)
                 }
             }
         }
-        cp_addpragma(pp, hash, text, 0);
+        // like gcc -E, #pragma once is the preprocessor's alone: not kept
+        b32 once = arg->kind == CP_IDENT && cp_equals(arg->text, S("once"));
+        if (!once) cp_addpragma(pp, hash, text, 0);
         return cp_skipline(arg);
     }
     if (cp_equals(w, S("error")) || cp_equals(w, S("warning"))) {
@@ -3178,6 +3609,25 @@ static cp_pptok *cp_directive(cp_pp *pp, cp_pptok *hash)
         cp_doassert(pp, cp_copyline(pp, &rest, arg), w.data[0] == 'u');
         return rest;
     }
+    if (cp_equals(w, S("line")) && !(pp->cfg && pp->cfg->nopp)) {
+        // "#line X" with macros: the lexer took the plain forms already
+        cp_pptok *rest;
+        cp_pptok *l = cp_expandlist(pp, cp_copyline(pp, &rest, arg));
+        if (l->kind == CP_INTLIT && l->text.len && cp_isdigit((u8)l->text.data[0])) {
+            b32 ok = 1;
+            i32 fl;
+            cp_pptok lm = *hash;
+            lm.lmline = (i32)cp_parseintval(l->text, &fl, &ok);
+            lm.lmfile = -1;
+            cp_pptok *f = l->next;
+            if (f && f->kind == CP_STRLIT && f->text.len >= 2 && f->text.data[0] == '"') {
+                lm.lmfile = cp_internfile(pp, cp_span(f->text.data+1, f->text.data+f->text.len-1));
+            }
+            lm.line = hash->line;  // the next line is lmline
+            cp_setline(pp, &lm);
+        }
+        return rest;
+    }
     if (cp_equals(w, S("line")) || cp_equals(w, S("ident")) || cp_equals(w, S("sccs")) ||
         t->kind == CP_INTLIT) {
         return cp_skipline(arg);
@@ -3188,7 +3638,12 @@ static cp_pptok *cp_directive(cp_pp *pp, cp_pptok *hash)
 
 static void cp_emit(cp_pp *pp, cp_pptok *t)
 {
+    if (t->kind == CP_PP_LINE) {  // one that rode along in macro arguments
+        cp_setline(pp, t);
+        return;
+    }
     cp_pptok *c = cp_copytok(pp, t);
+    cp_mappos(pp, &c->file, &c->line);
     if (pp->outtail) pp->outtail->next = c; else pp->outhead = c;
     pp->outtail = c;
     if (c->exp) {
@@ -3205,7 +3660,22 @@ static b32 cp_pragmaop(cp_pp *pp, cp_pptok **rest, cp_pptok *t)
     if (t->kind != CP_IDENT || t->next->kind != CP_LPAREN) return 0;
     if (cp_equals(t->text, S("_Pragma"))) {
         cp_pptok *s = t->next->next;
-        if (s->kind != CP_STRLIT || s->next->kind != CP_RPAREN) return 0;
+        cp_pptok *after = s->next->next;
+        if (s->kind != CP_STRLIT || s->next->kind != CP_RPAREN) {
+            // the operand may come out of a macro, as GCC allows:
+            // _Pragma(STR(GCC diagnostic ignored "-Wx"))
+            cp_pptok *close;
+            after = cp_skipgroup(t->next, &close);
+            if (close->kind != CP_RPAREN) return 0;
+            cp_pptok head = {0};
+            cp_pptok *tail = &head;
+            for (cp_pptok *p = t->next->next; p != close; p = p->next) {
+                tail = tail->next = cp_copytok(pp, p);
+            }
+            tail->next = cp_neweof(pp, close);
+            s = cp_expandlist(pp, head.next);
+            if (s->kind != CP_STRLIT || s->next->kind != CP_EOF) return 0;
+        }
         // destringize: drop prefix and quotes, unescape \" and \\ .
         cp_str q = s->text;
         iz i = 0;
@@ -3218,7 +3688,7 @@ static b32 cp_pragmaop(cp_pp *pp, cp_pptok **rest, cp_pptok *t)
             buf[n++] = body.data[j];
         }
         cp_addpragma(pp, t, cp_span(buf, buf+n), 0);
-        *rest = s->next->next;
+        *rest = after;
         return 1;
     }
     if (cp_equals(t->text, S("__pragma"))) {
@@ -3229,6 +3699,11 @@ static b32 cp_pragmaop(cp_pp *pp, cp_pptok **rest, cp_pptok *t)
         char *buf = cp_new(pp->mem, len, char);
         iz n = 0;
         for (cp_pptok *p = t; p != after && p->kind != CP_EOF; p = p->next) {
+            if (p->kind == CP_OTHER && p->text.len && (p->text.data[0] == '"' || p->text.data[0] == '\'')) {
+                // printed on one line, the stray quote would pair with
+                // a later one and swallow the code after it
+                cp_pperror(pp, p, 0, S("unterminated literal in __pragma"));
+            }
             if (p != t && (p->flags & CP_TF_SPACE)) buf[n++] = ' ';
             cp_memcpy(buf+n, p->text.data, p->text.len);
             n += p->text.len;
@@ -3256,11 +3731,16 @@ static void cp_ppmain(cp_pp *pp, cp_pptok *t)
             t = t->next;
             continue;
         }
+        if (t->kind == CP_PP_LINE) {  // reached, so not in a skipped group
+            cp_setline(pp, t);
+            t = t->next;
+            continue;
+        }
         if (t->kind == CP_HASH && (t->flags & CP_TF_BOL) && !t->macro) {
             t = cp_directive(pp, t);
             continue;
         }
-        if (!(pp->cfg && pp->cfg->nopp) && cp_expand(pp, &t, t)) continue;
+        if (!pp->nopp && cp_expand(pp, &t, t)) continue;
         if (cp_pragmaop(pp, &t, t)) continue;
         cp_emit(pp, t);
         t = t->next;
@@ -3286,6 +3766,7 @@ static u64 cp_parseintval(cp_str s, i32 *flags, b32 *ok)
     *flags = 0;
     if (e-p >= 2 && p[0]=='0' && (p[1]|32)=='x') { base = 16; p += 2; }
     else if (e-p >= 2 && p[0]=='0' && (p[1]|32)=='b') { base = 2; p += 2; }
+    else if (e-p >= 2 && p[0]=='0' && (p[1]|32)=='o') { base = 8; p += 2; }  // C2y
     else if (e-p >= 1 && p[0]=='0') { base = 8; }
     b32 any = 0;
     for (; p < e; p++) {
@@ -3394,11 +3875,22 @@ static i64 cp_parsecharval(cp_str s, b32 *ok)
     if (p >= e) { *ok = 0; return 0; }
     p++;
     e--;  // closing quote
+    b32 utf16 = p - s.data == 2 && s.data[0] == 'u';  // u'x', not u8'x'
     i64 v = 0;
     i32 n = 0;
-    while (p < e) {
+    while ((p = cp_skipsplices(p, e)) < e) {
         b32 raw;
-        u32 c = cp_decodechar(&p, e, &raw);
+        u32 c;
+        if (!prefixed && *p != '\\' && (u8)*p >= 0x80) {
+            c = (u8)*p++;  // a plain constant holds UTF-8 bytes: 'é' is two
+        } else {
+            c = cp_decodechar(&p, e, &raw);
+        }
+        if (utf16 && c > 0xffff) {
+            // GCC truncates a numeric escape, and keeps the low surrogate
+            // of a character outside the BMP
+            c = raw ? c & 0xffff : 0xdc00 | ((c - 0x10000) & 0x3ff);
+        }
         if (prefixed) {
             v = c;
         } else {
@@ -3488,6 +3980,7 @@ struct cp_scope {
     cp_map   *names;  // ordinary identifiers -> cp_sym
     cp_map   *tags;   // tags -> cp_sym (kind CP_SYM_TAG, ty the tag type)
     i32       depth;
+    b32       params;  // a function's parameter list
 };
 
 typedef struct cp_packstack cp_packstack;
@@ -3525,8 +4018,11 @@ typedef struct {
     i32        nextpragma;
     i32        instruct;     // parsing struct members
     i32        inoffsetof;   // parsing a __builtin_offsetof designator
+    b32        clang;        // the configured compiler is Clang
+    b32        c23;          // compiling C23 or later: () means (void)
     i32        unevaluated;  // inside sizeof, _Alignof, typeof or a
                              //   _Generic selector: uses read nothing
+    cp_attr   *nameattrs;    // [[...]] after the last declarator name
 } cp_parser;
 
 #define cp_tok(p)      (&(p)->toks[(p)->pos])
@@ -3611,11 +4107,6 @@ static cp_type *cp_mktype(cp_parser *p, i32 kind)
     t->len = -1;
     t->tok = -1;
     return t;
-}
-
-static b32 cp_istag(cp_type *t)
-{
-    return t && (t->kind == CP_T_STRUCT || t->kind == CP_T_UNION || t->kind == CP_T_ENUM);
 }
 
 static cp_type *cp_arrayof(cp_parser *p, cp_type *base, i64 len);
@@ -3707,8 +4198,8 @@ static void cp_setbt(cp_parser *p, i32 basic, i64 size, i64 align)
     p->cbt[basic] = c;
 }
 
-// The value of a predefined integer macro such as __SIZEOF_LONG_DOUBLE__,
-// or -1 when it is not a plain small number.
+// The value of a predefined integer macro such as __SIZEOF_LONG_DOUBLE__
+// or __STDC_VERSION__, or -1 when it is not a plain decimal number.
 static i64 cp_predefint(cp_parser *p, cp_str name)
 {
     i64 v = -1;
@@ -3716,9 +4207,15 @@ static i64 cp_predefint(cp_parser *p, cp_str name)
         if (!cp_equals(m->name, name) || m->nbody != 1 || m->body[0].kind != CP_INTLIT) continue;
         cp_str t = m->body[0].text;
         v = 0;
-        for (iz i = 0; i < t.len && v >= 0; i++) {
-            v = cp_isdigit((u8)t.data[i]) && v < 1000 ? v*10 + (t.data[i] - '0') : -1;
+        iz i = 0;
+        for (; i < t.len && cp_isdigit((u8)t.data[i]) && v < (i64)1 << 40; i++) {
+            v = v*10 + (t.data[i] - '0');
         }
+        for (; i < t.len; i++) {  // only an integer suffix may follow
+            char c = t.data[i] | 32;
+            if (c != 'l' && c != 'u') v = -1;
+        }
+        if (!t.len) v = -1;
     }
     return v;
 }
@@ -3726,6 +4223,8 @@ static i64 cp_predefint(cp_parser *p, cp_str name)
 static void cp_inittypes(cp_parser *p)
 {
     i32 tg = p->target;
+    p->clang = cp_predefint(p, S("__clang__")) >= 0;
+    p->c23 = cp_predefint(p, S("__STDC_VERSION__")) >= 202311;
     p->ptrsize = tg == CP_TARGET_ILP32 ? 4 : 8;
     i64 lsize = tg == CP_TARGET_LP64 ? 8 : 4;
     cp_setbt(p, CP_BT_VOID, 1, 1);  // GNU: sizeof(void) == 1
@@ -3789,7 +4288,7 @@ static b32 cp_isinteger(cp_type *t)
 
 static b32 cp_isfloating(cp_type *t)
 {
-    return t && t->kind == CP_T_BUILTIN && (t->basic >= CP_BT_FLOAT16 || (t->flags & CP_TF_COMPLEX));
+    return t && t->kind == CP_T_BUILTIN && ((t->basic >= CP_BT_FLOAT16 && t->basic <= CP_BT_DEC128) || (t->flags & CP_TF_COMPLEX));
 }
 
 static b32 cp_isarith(cp_type *t)  { return cp_isinteger(t) || cp_isfloating(t); }
@@ -3895,9 +4394,12 @@ static cp_type *cp_uac(cp_parser *p, cp_type *a, cp_type *b)
         i64 wa = a->kind == CP_T_BITINT ? a->len : a->size*8;
         i64 wb = b->kind == CP_T_BITINT ? b->len : b->size*8;
         if (wa != wb) return wa > wb ? a : b;
-        if (cp_isunsigned(p, a)) return a;
-        if (cp_isunsigned(p, b)) return b;
-        return a->kind == CP_T_BITINT ? b : a;
+        b32 uns = cp_isunsigned(p, a) || cp_isunsigned(p, b);
+        if (a->kind == CP_T_BITINT && b->kind == CP_T_BITINT) return cp_isunsigned(p, a) || !uns ? a : b;
+        // a standard type outranks a bit-precise one of its width, so the
+        // result is the standard type, unsigned if either operand is
+        cp_type *std = a->kind == CP_T_BITINT ? b : a;
+        return uns ? cp_tosigned(p, std, 1) : std;
     }
     if (a == b) return a;
     b32 ua = cp_isunsigned(p, a), ub = cp_isunsigned(p, b);
@@ -4061,6 +4563,8 @@ typedef struct {
     i32 mode;        // CP_BT_* from mode(), -1 if none
     b32 transparent;
     i32 ms;          // 1 ms_struct, -1 gcc_struct, 0 unspecified
+    b32 noreturn;
+    b32 abi;         // ms_abi or sysv_abi: GCC makes a distinct type
 } cp_attrinfo;
 
 static cp_str cp_stripunders(cp_str s)
@@ -4124,6 +4628,10 @@ static void cp_scanattrs(cp_parser *p, cp_attr *a, cp_attrinfo *info)
                     v = e && e->isconst == 1 ? e->cval : 0;
                 }
                 if (v > info->aligned && v <= CP_MAXALIGN) info->aligned = v;
+            } else if (cp_equals(name, S("noreturn"))) {
+                info->noreturn = 1;
+            } else if (cp_equals(name, S("ms_abi")) || cp_equals(name, S("sysv_abi"))) {
+                info->abi = 1;
             } else if (cp_equals(name, S("packed"))) {
                 info->packed = 1;
             } else if (cp_equals(name, S("vector_size")) && argbeg >= 0) {
@@ -4138,7 +4646,9 @@ static void cp_scanattrs(cp_parser *p, cp_attr *a, cp_attrinfo *info)
                 // DImode is long on LP64, long long elsewhere
                 else if (cp_equals(m, S("DI"))) info->mode = cp_int64bt(p);
                 else if (cp_equals(m, S("TI"))) info->mode = CP_BT_INT128;
-                else if (cp_equals(m, S("word")) || cp_equals(m, S("pointer"))) {
+                else if (cp_equals(m, S("word")) || cp_equals(m, S("pointer")) ||
+                         cp_equals(m, S("unwind_word")) || cp_equals(m, S("libgcc_cmp_return")) ||
+                         cp_equals(m, S("libgcc_shift_count"))) {
                     info->mode = p->ptrsize == 4 ? CP_BT_INT : cp_int64bt(p);
                 }
                 else if (cp_equals(m, S("SF"))) info->mode = CP_BT_FLOAT;
@@ -4163,10 +4673,49 @@ static void cp_scanattrs(cp_parser *p, cp_attr *a, cp_attrinfo *info)
     }
 }
 
+// ms_abi written inside a declarator, "int (__attribute__((ms_abi)) *f)()",
+// sits on its pointer: find it there too.
+static void cp_scanabi(cp_parser *p, cp_type *syn, cp_attrinfo *ai)
+{
+    for (i32 depth = 0; syn && depth < 64; syn = syn->base, depth++) {
+        if (!syn->attrs) continue;
+        cp_attrinfo t = {0};
+        t.mode = -1;
+        cp_scanattrs(p, syn->attrs, &t);
+        ai->abi |= t.abi;
+    }
+}
+
 // Apply mode() and vector_size() to a type.
 static cp_type *cp_applytypeattrs(cp_parser *p, cp_type *t, cp_attrinfo *ai)
 {
     if (!t) return t;
+    if (ai->noreturn && t->kind == CP_T_POINTER && t->base && t->base->kind == CP_T_FUNC &&
+        !(t->base->flags & CP_TF_NORETURN)) {
+        // GCC's "volatile function": a distinct type, which only
+        // --typecheck needs to know about
+        cp_type *f = cp_new(p->mem, 1, cp_type);
+        *f = *t->base;
+        f->sem = f;
+        f->unqual = f;
+        f->variants_ = 0;
+        f->flags |= CP_TF_NORETURN;
+        t = cp_qualify(p, cp_ptrto(p, f), t->quals);
+    }
+    if (ai->abi && p->target == CP_TARGET_LP64) {
+        // like noreturn above: only --typecheck needs to know
+        cp_type **fp = t->kind == CP_T_FUNC ? &t :
+                       t->kind == CP_T_POINTER && t->base && t->base->kind == CP_T_FUNC ? &t->base : 0;
+        if (fp && !((*fp)->flags & CP_TF_ABI)) {
+            cp_type *f = cp_new(p->mem, 1, cp_type);
+            *f = **fp;
+            f->sem = f;
+            f->unqual = f;
+            f->variants_ = 0;
+            f->flags |= CP_TF_ABI;
+            t = fp == &t ? f : cp_qualify(p, cp_ptrto(p, f), t->quals);
+        }
+    }
     if (ai->mode >= 0) {
         i32 m = ai->mode;
         if (t->kind == CP_T_BUILTIN || t->kind == CP_T_ENUM) {
@@ -4331,6 +4880,7 @@ static b32 cp_iskrdef(cp_parser *p, i32 i)
     return 0;
 }
 
+static i32 cp_skipattrsat(cp_parser *p, i32 i);
 static b32 cp_ismacroattr(cp_parser *p, i32 i, i32 where)
 {
     if (p->toks[i].kind != CP_IDENT || cp_lookup(p, p->toks[i].text)) return 0;
@@ -4344,10 +4894,24 @@ static b32 cp_ismacroattr(cp_parser *p, i32 i, i32 where)
     if (where == CP_MA_LEAD && p->toks[i+1].kind == CP_LPAREN && cp_iskrdef(p, i)) return 0;
     switch (where) {
     case CP_MA_LEAD:
-        // maybe a short run of them: "DECLSPEC SDLCALL int f(void);"
-        for (i32 n = 0; n < 4 && k == CP_IDENT && !cp_lookup(p, p->toks[j].text); n++) {
-            j = cp_macroattrend(p, j);
+        // maybe a short run of them, with qualifiers and attributes:
+        // "DECLSPEC SDLCALL int f(void);", "API const __attribute__((x)) int"
+        for (i32 n = 0; n < 8 && j < p->ntoks-1; n++) {
+            if (k == CP_IDENT && !cp_lookup(p, p->toks[j].text)) {
+                j = cp_macroattrend(p, j);
+            } else if (cp_isqualkw(k) && k != CP_K_ATOMIC) {
+                j++;
+            } else if (cp_isattrkw(p, j)) {
+                j = cp_skipattrsat(p, j);
+            } else {
+                break;
+            }
             k = p->toks[j].kind;
+        }
+        if (k == CP_IDENT && cp_istypedef(p, p->toks[j].text)) {
+            // "EXPORT T f(void);" with T a typedef, but not "unknown_t T;"
+            i32 k2 = p->toks[j+1 < p->ntoks ? j+1 : j].kind;
+            return k2 == CP_IDENT || k2 == CP_STAR || k2 == CP_LPAREN || cp_isqualkw(k2);
         }
         return (cp_istypespeckw(k) && k != CP_K_ATOMIC) || cp_isstoragekw(k) ||
                k == CP_K_EXTENSION;
@@ -4367,6 +4931,11 @@ static b32 cp_ismacroattr(cp_parser *p, i32 i, i32 where)
         return (k == CP_IDENT && (k2 == CP_IDENT || k2 == CP_LBRACK)) || k == CP_STAR;
     }
     case CP_MA_TRAIL:
+        // maybe a short run of them: "void f(void) NORETURN PRINTF(1, 2);"
+        for (i32 n = 0; n < 4 && k == CP_IDENT && !cp_lookup(p, p->toks[j].text); n++) {
+            j = cp_macroattrend(p, j);
+            k = p->toks[j].kind;
+        }
         return k == CP_SEMI || k == CP_COMMA || k == CP_ASSIGN || k == CP_LBRACE ||
                k == CP_RPAREN || k == CP_COLON || cp_isattrkw(p, j);
     }
@@ -4635,7 +5204,11 @@ static cp_specs cp_parsespecs(cp_parser *p)
             goto done;
         }
         if (cp_isattrkw(p, p->pos) || k == CP_K_ALIGNAS) {
-            cp_attrappend(&s.attrs, cp_attrone(p));
+            cp_attr *a = cp_attrone(p);
+            // "int [[x]] v", "vpid __ptr64 *p": a standard or keyword attribute
+            // after the type is printed there too
+            if (a) a->aftertype = (a->kind == CP_A_STD || a->kind == CP_A_KEYWORD) && (base || bits);
+            cp_attrappend(&s.attrs, a);
             s.any = 1;
             continue;
         }
@@ -4744,11 +5317,21 @@ static cp_specs cp_parsespecs(cp_parser *p)
             if (base) goto done;
             base = cp_syntype(p, CP_T_AUTOTYPE, tok);
             break;
-        case CP_IDENT:
-            if (cp_ismacroattr(p, p->pos, base || bits ? CP_MA_MORE : CP_MA_LEAD) ||
-                ((base || bits) && cp_ismacroattr(p, p->pos, CP_MA_MID))) {
+        case CP_IDENT: {
+            // After a type only "unsigned X long" (more keywords) and
+            // "int X f" (the declarator next) are taken: the printer moves
+            // storage classes first and keeps keywords together, so it
+            // could not keep X in "T X int" or "int X static"
+            i32 nk = p->toks[cp_macroattrend(p, p->pos)].kind;
+            b32 more = !base && cp_istypespeckw(nk) && nk != CP_K_STRUCT && nk != CP_K_UNION &&
+                       nk != CP_K_ENUM && nk != CP_K_TYPEOF && nk != CP_K_TYPEOF_UNQUAL &&
+                       nk != CP_K_BITINT && nk != CP_K_AUTO_TYPE && nk != CP_K_ATOMIC;
+            if ((!base && !bits && cp_ismacroattr(p, p->pos, CP_MA_LEAD)) ||
+                ((base || bits) && ((more && cp_ismacroattr(p, p->pos, CP_MA_MORE)) ||
+                                    cp_ismacroattr(p, p->pos, CP_MA_MID)))) {
                 cp_attr *a = cp_macroattr(p);
                 a->aftertype = base || bits;  // printed there, or "A B *p" swaps
+                a->leading = !base && !bits;  // printed before storage classes
                 cp_attrappend(&s.attrs, a);
                 s.any = 1;
                 continue;
@@ -4764,6 +5347,7 @@ static cp_specs cp_parsespecs(cp_parser *p)
                 break;
             }
             goto done;
+        }
         default:
             goto done;
         }
@@ -4895,12 +5479,13 @@ static cp_type *cp_resolve(cp_parser *p, cp_type *t)
     } break;
     case CP_T_FUNC: {
         r = cp_mktype(p, CP_T_FUNC);
-        r->base = cp_resolve(p, t->base);
+        // the return type's qualifiers go: const int f(void) is int(void)
+        r->base = cp_unqualified(cp_resolve(p, t->base));
         r->size = 1;
         r->align = 1;
         r->flags = t->flags & CP_TF_VARIADIC;
-        if (!t->params || (t->flags & CP_TF_KR)) {
-            r->flags |= CP_TF_NOPROTO;
+        if ((t->flags & CP_TF_KR) || (!t->params && !p->c23)) {
+            r->flags |= CP_TF_NOPROTO;  // in C23, () means (void)
             break;
         }
         i32 n = 0;
@@ -5022,13 +5607,20 @@ static cp_type *cp_declarator(cp_parser *p, cp_type *base, cp_str *name, i32 *na
             else cp_attrappend(&inner->attrs, inattrs);
         }
     } else {
+        cp_attr *at = 0;
         if (cp_kind(p) == CP_IDENT) {
             *name = cp_tok(p)->text;
             *nametok = p->pos;
             *sawname = 1;
             cp_next(p);
+            // C23: "f [[noreturn]] (void)" gives the attributes to f
+            if (cp_kind(p) == CP_LBRACK && cp_peekk(p, 1) == CP_LBRACK) {
+                cp_attrs(p, &at);
+                for (cp_attr *a = at; a; a = a->next) a->aftername = 1;
+            }
         }
         r = cp_suffixes(p, base, sawname);
+        cp_attrappend(&p->nameattrs, at);
     }
     p->depth--;
     return r;
@@ -5040,8 +5632,12 @@ static cp_node *cp_newdeclarator(cp_parser *p, cp_type *base)
     i32 nametok = -1;
     b32 sawname = 0;
     p->fnscope = 0;
+    cp_attr *outer = p->nameattrs;  // nested: a parameter's declarator
+    p->nameattrs = 0;
     d->type = cp_declarator(p, base, &d->text, &nametok, &sawname);
     if (nametok >= 0) d->tok = nametok;
+    d->attrs = p->nameattrs;
+    p->nameattrs = outer;
     return d;
 }
 
@@ -5052,6 +5648,7 @@ static void cp_params(cp_parser *p, cp_type *fn)
     cp_scope *outer = p->scope;
     cp_pushscope(p);
     cp_scope *scope = p->scope;
+    scope->params = 1;
     cp_node head = {0};
     cp_node *tail = &head;
     i32 saveinstruct = p->instruct;
@@ -5154,6 +5751,7 @@ static cp_sym *cp_tagsym(cp_parser *p, i32 kind, cp_str name, b32 local, i32 tok
     t->size = -1;
     t->align = 1;
     t->flags |= CP_TF_INCOMPLETE;
+    if (p->scope->params) t->flags |= CP_TF_PROTOTAG;
     s->ty = t;
     cp_map *m = cp_upsert(&p->scope->tags, name, p->mem);
     m->val = s;
@@ -5425,6 +6023,14 @@ static void cp_layout(cp_parser *p, cp_type *obj, cp_attr *structattrs)
                 if (d->text.len || ma.aligned) {
                     if (fa > align) align = fa;
                 }
+                // i386 GCC: a full-width bit-field with an aligned
+                // attribute that lands on its type's natural boundary is
+                // laid out as a plain field, of the type's natural
+                // alignment (8 for long long, not the 4 of i386 fields)
+                if (p->target == CP_TARGET_ILP32 && ma.aligned && !bpacked && !pack &&
+                    tsize == 8 && w == 64 && (isunion || (bits - w) % 64 == 0) && align < 8) {
+                    align = 8;
+                }
             } else {
                 i64 ma_ = packed ? 1 : talign;
                 if (pack && ma_ > pack) ma_ = pack;
@@ -5474,17 +6080,24 @@ static cp_node *cp_memberdecl(cp_parser *p)
     if (cp_kind(p) != CP_SEMI) {
         for (;;) {
             cp_node *d;
+            cp_attr *lead = 0;
+            if (tail != &head) cp_attrs(p, &lead);  // "int a, __attribute__((x)) b;"
             if (cp_kind(p) == CP_COLON) {
                 d = cp_newnode(p, CP_D_DECLARATOR, p->pos);
                 d->type = sp.type;
             } else {
                 d = cp_newdeclarator(p, sp.type);
             }
+            cp_attrappend(&lead, d->attrs);
+            d->attrs = lead;
             cp_trailattrs(p, &d->attrs);
             if (cp_accept(p, CP_COLON)) {
                 d->b = cp_condexpr(p);
             }
-            cp_trailattrs(p, &d->attrs);
+            cp_attr *aw = 0;
+            cp_trailattrs(p, &aw);
+            for (cp_attr *a = aw; a; a = a->next) a->afterwidth = 1;
+            cp_attrappend(&d->attrs, aw);
             cp_type *ty = cp_resolve(p, d->type);
             cp_attrinfo ai = {0};
             ai.mode = -1;
@@ -5516,7 +6129,9 @@ static cp_type *cp_structspec(cp_parser *p)
         syn->name = cp_tok(p)->text;
         cp_next(p);
     }
-    cp_attrs(p, &syn->attrs);
+    // attributes after the tag belong to the type only in a definition;
+    // in "struct s __attribute__((cleanup(f))) x;" they are x's
+    if (p->toks[cp_skipattrsat(p, p->pos)].kind == CP_LBRACE) cp_attrs(p, &syn->attrs);
     if (cp_kind(p) == CP_LBRACE) {
         cp_type *obj;
         cp_sym *s = 0;
@@ -5586,7 +6201,11 @@ static cp_type *cp_enumspec(cp_parser *p)
         syn->name = cp_tok(p)->text;
         cp_next(p);
     }
-    cp_attrs(p, &syn->attrs);
+    {
+        // as for struct: the type's attributes only before a body or ":"
+        i32 k = p->toks[cp_skipattrsat(p, p->pos)].kind;
+        if (k == CP_LBRACE || k == CP_COLON) cp_attrs(p, &syn->attrs);
+    }
     cp_type *fixed = 0;
     if (cp_kind(p) == CP_COLON && (cp_istypestart(p, p->pos+1))) {
         cp_next(p);
@@ -5630,7 +6249,7 @@ static cp_type *cp_enumspec(cp_parser *p)
     cp_node head = {0};
     cp_node *tail = &head;
     i64 next = 0, lo = 0, hi = 0;
-    b32 first = 1;
+    b32 first = 1, big = 0;  // big: a value of 2^63 or more (held negative)
     while (cp_kind(p) != CP_RBRACE) {
         cp_applypragmas(p);
         if (cp_kind(p) != CP_IDENT) cp_fail(p, "expected enumerator name");
@@ -5638,18 +6257,22 @@ static cp_type *cp_enumspec(cp_parser *p)
         e->text = cp_tok(p)->text;
         cp_next(p);
         cp_attrs(p, &e->attrs);
+        b32 thisbig = 0;
         if (cp_accept(p, CP_ASSIGN)) {
             e->a = cp_condexpr(p);
             if (e->a->isconst == 1) {
                 next = e->a->cval;
+                thisbig = next < 0 && e->a->ty && cp_isinteger(e->a->ty) && e->a->ty->size >= 8 &&
+                          cp_isunsigned(p, e->a->ty);
             } else {
                 cp_warn(p, e->a->tok, S("enumerator value is not an integer constant"));
             }
         }
         e->cval = next;
         e->isconst = 1;
-        if (first || next < lo) lo = next;
-        if (first || next > hi) hi = next;
+        big |= thisbig;
+        if (!thisbig && (first || next < lo)) lo = next;
+        if (!thisbig && (first || next > hi)) hi = next;
         first = 0;
         next++;
         cp_sym *s = cp_newsym(p, e->text, CP_SYM_ENUMCONST);
@@ -5658,7 +6281,7 @@ static cp_type *cp_enumspec(cp_parser *p)
         s->flags |= CP_YF_DEFINED;
         cp_addref(p, &s->decls, &s->lastdecl_, e, 0, CP_RF_DECL);
         // C23: the constant has type int while its value fits
-        b32 fitsint = e->cval >= INT32_MIN && e->cval <= INT32_MAX;
+        b32 fitsint = !thisbig && e->cval >= INT32_MIN && e->cval <= INT32_MAX;
         s->ty = fixed ? obj : fitsint ? p->bt[CP_BT_INT] : obj;
         e->ty = s->ty;
         cp_bindname(p, e->text, s);
@@ -5683,6 +6306,8 @@ static cp_type *cp_enumspec(cp_parser *p)
             else u = lo >= -128 && hi <= 127 ? p->bt[CP_BT_SCHAR] :
                      lo >= -32768 && hi <= 32767 ? p->bt[CP_BT_SHORT] :
                      lo >= INT32_MIN && hi <= INT32_MAX ? p->bt[CP_BT_INT] : p->bt[CP_BT_LLONG];
+        } else if (big) {
+            u = p->bt[p->target == CP_TARGET_LP64 ? CP_BT_ULONG : CP_BT_ULLONG];
         } else if (lo >= 0) {
             u = hi <= (i64)UINT32_MAX ? p->bt[CP_BT_UINT] : p->bt[CP_BT_ULONG];
             if (hi > (i64)UINT32_MAX && p->target != CP_TARGET_LP64) u = p->bt[CP_BT_ULLONG];
@@ -5699,7 +6324,7 @@ static cp_type *cp_enumspec(cp_parser *p)
     }
     // C23: if any value does not fit in int, every constant has the
     // enumerated type once the list is complete
-    if (!fixed && (lo < INT32_MIN || hi > INT32_MAX)) {
+    if (!fixed && (big || lo < INT32_MIN || hi > INT32_MAX)) {
         for (cp_node *e = head.next; e; e = e->next) e->ty = obj;
     }
     for (cp_node *e = head.next; e; e = e->next) {
@@ -5722,6 +6347,14 @@ static void cp_declare(cp_parser *p, cp_node *d, i32 storage, cp_node *def, b32 
     cp_map *slot = cp_upsert(&p->scope->names, d->text, p->mem);
     cp_sym *s = (cp_sym *)slot->val;
     if (s && s->kind == CP_SYM_PARAM && kr) {
+        // a K&R parameter's type is adjusted as a prototype's is
+        if (ty && ty->kind == CP_T_ARRAY) {
+            i32 q = d->type && d->type->kind == CP_T_ARRAY ? d->type->quals : 0;
+            ty = cp_qualify(p, cp_ptrto(p, ty->base), q);
+        } else if (ty && ty->kind == CP_T_FUNC) {
+            ty = cp_ptrto(p, ty);
+        }
+        d->ty = ty;
         s->ty = ty;
         s->decl = d;
         s->def = d;
@@ -5869,45 +6502,93 @@ static b32 cp_ischarish(cp_type *t)
     return 0;
 }
 
+// Does member-designator name pick out this member declaration, directly
+// or inside an anonymous member?
+static b32 cp_hasmember(cp_node *decl, cp_str name, i32 depth)
+{
+    if (depth > 64) return 0;
+    if (decl->eflags & CP_EF_ANONMEMBER) {
+        cp_type *at = decl->type ? decl->type->sem : 0;
+        for (cp_node *m = at ? at->members : 0; m; m = m->next) {
+            if (m->kind == CP_D_DECL && cp_hasmember(m, name, depth+1)) return 1;
+        }
+        return 0;
+    }
+    for (cp_node *d = decl->list; d; d = d->next) {
+        if (cp_equals(d->text, name)) return 1;
+    }
+    return 0;
+}
+
 // Consume initializer items for one object of type t with braces elided
-// (C 6.7.9p20). The first item may carry a designator.
-static void cp_consumeinit(cp_type *t, cp_node **it, b32 first, i32 depth)
+// (C 6.7.9p20). The first item may carry designators (first is set); desig
+// is the part of its designator chain still to follow inside t, as in
+// "[0].x[2].b = 10, 11", where 11 goes after x[2].b.
+static void cp_consumeinit(cp_type *t, cp_node **it, cp_node *desig, b32 first, i32 depth)
 {
     cp_node *item = *it;
     if (!item || depth > 64) return;
     if (!first && item->b) return;
-    if (item->a && item->a->kind == CP_E_INITLIST) { *it = item->next; return; }
+    if (!desig && item->a && item->a->kind == CP_E_INITLIST) { *it = item->next; return; }
     if (!t) { *it = item->next; return; }
     t = t->unqual ? t->unqual : t;
     if (t->kind == CP_T_ARRAY) {
-        if (item->a && item->a->kind == CP_E_STRING && cp_ischarish(t->base)) {
+        if (!desig && item->a && item->a->kind == CP_E_STRING && cp_ischarish(t->base)) {
             *it = item->next;
             return;
         }
-        for (i64 k = 0; (t->len < 0 || k < t->len) && *it; k++) {
-            if (!(first && k == 0) && (*it)->b) break;
-            cp_consumeinit(t->base, it, first && k == 0, depth+1);
+        i64 k0 = 0;
+        cp_node *rest = 0;
+        if (desig && desig->kind == CP_E_DINDEX && desig->a && desig->a->isconst == 1) {
+            k0 = desig->b && desig->b->isconst == 1 ? desig->b->cval : desig->a->cval;
+            rest = desig->next;
+        }
+        for (i64 k = k0; (t->len < 0 || k < t->len) && *it; k++) {
+            b32 lead = k == k0;
+            if (!(first && lead) && (*it)->b) break;
+            cp_consumeinit(t->base, it, lead ? rest : 0, first && lead, depth+1);
         }
         return;
     }
     if (t->kind == CP_T_STRUCT || t->kind == CP_T_UNION) {
+        // an expression of the same struct type initializes all of it:
+        // "struct S c[] = {a, b};"
+        if (!desig && item->a && item->a->ty) {
+            cp_type *v = item->a->ty->sem ? item->a->ty->sem : item->a->ty;
+            if ((v->unqual ? v->unqual : v) == t) { *it = item->next; return; }
+        }
+        // start at the designated member, if any
+        cp_node *start = t->members;
+        b32 named = desig && desig->kind == CP_E_DFIELD;
+        if (named) {
+            for (cp_node *m = t->members; m; m = m->next) {
+                if (m->kind == CP_D_DECL && cp_hasmember(m, desig->text, 0)) { start = m; break; }
+            }
+        }
         b32 any = 0;
-        for (cp_node *decl = t->members; decl && *it; decl = decl->next) {
+        for (cp_node *decl = start; decl && *it; decl = decl->next) {
             if (decl->kind != CP_D_DECL) continue;
             if (!decl->list) {
                 cp_type *at = decl->type ? decl->type->sem : 0;
                 if (at && (decl->eflags & CP_EF_ANONMEMBER)) {
                     if (any && (*it)->b) return;
-                    cp_consumeinit(at, it, first && !any, depth+1);
+                    // an anonymous member finds the designated name itself
+                    cp_consumeinit(at, it, !any && named ? desig : 0, first && !any, depth+1);
                     any = 1;
                     if (t->kind == CP_T_UNION) return;
                 }
                 continue;
             }
-            for (cp_node *d = decl->list; d && *it; d = d->next) {
+            cp_node *d = decl->list;
+            if (!any && named) {
+                while (d && !cp_equals(d->text, desig->text)) d = d->next;
+                if (!d) d = decl->list;
+            }
+            for (; d && *it; d = d->next) {
                 if (!d->text.len) continue;  // unnamed bit-fields take nothing
                 if (any && (*it)->b) return;
-                cp_consumeinit(d->ty, it, first && !any, depth+1);
+                cp_node *rest = !any && named ? desig->next : 0;
+                cp_consumeinit(d->ty, it, rest, first && !any, depth+1);
                 any = 1;
                 if (t->kind == CP_T_UNION) return;
             }
@@ -5939,7 +6620,7 @@ static cp_type *cp_completearray(cp_parser *p, cp_type *ty, cp_node *init)
                     if (it->b->b && it->b->b->isconst == 1) idx = it->b->b->cval;
                 }
                 cp_node *before = it;
-                cp_consumeinit(ty->base, &it, 1, 0);
+                cp_consumeinit(ty->base, &it, it->b ? it->b->next : 0, 1, 0);
                 if (it == before) it = it->next;  // always make progress
                 idx++;
                 if (idx > max) max = idx;
@@ -5949,6 +6630,13 @@ static cp_type *cp_completearray(cp_parser *p, cp_type *ty, cp_node *init)
     }
     if (n < 0) return ty;
     cp_type *r = cp_arrayof(p, ty->base, n);
+    if (n == 0) {
+        // "int a[] = {}" (GNU, C23) stays int[], but with size 0: GCC and
+        // Clang alike, and unlike int[0]
+        r = cp_arrayof(p, ty->base, -1);
+        r->size = 0;
+        r->flags &= ~CP_TF_INCOMPLETE;
+    }
     return cp_qualify(p, r, ty->quals);
 }
 
@@ -5964,14 +6652,15 @@ static void cp_sidefx(cp_node *n)
     n->eflags |= f & CP_EF_SIDEEFFECT;
 }
 
-static cp_node *cp_parsetypename(cp_parser *p)
+// keepfn leaves p->fnscope at the type's parameters: ^ int (int v) {...}
+static cp_node *cp_parsetypename2(cp_parser *p, b32 keepfn)
 {
     cp_node *n = cp_newnode(p, CP_E_TYPEARG, p->pos);
     cp_specs sp = cp_parsespecs(p);
     if (!sp.any) cp_fail(p, "expected type name");
     cp_scope *savefn = p->fnscope;
     cp_node *d = cp_newdeclarator(p, sp.type);
-    p->fnscope = savefn;
+    if (!keepfn) p->fnscope = savefn;
     if (d->text.len) cp_fail(p, "unexpected name in type name");
     cp_attrs(p, &d->attrs);
     n->type = d->type;
@@ -6036,7 +6725,7 @@ static const cp_builtindef cp_builtins[] = {
     {"umul_overflow", 'b'}, {"umull_overflow", 'b'}, {"umulll_overflow", 'b'},
     {"speculation_safe_value", 'a'}, {"LINE", 'i'}, {"FILE", 'C'},
     {"FUNCTION", 'C'}, {"launder", 'a'}, {"assume", 'v'},
-    {"clear_padding", 'v'}, {"has_attribute", 'b'}, {"shuffle", 'T'}, {"shufflevector", 'a'},
+    {"clear_padding", 'v'}, {"has_attribute", 'b'}, {"shuffle", 'T'}, {"shufflevector", 'S'},
     {"bit_cast", 'T'}, {"va_arg", 'U'}, {"convertvector", 'U'},
     {"complex", 'K'}, {"choose_expr", 'X'}, {"tgmath", 'a'},
     {"isinf_sign", 'i'}, {"stack_save", 'p'}, {"stack_restore", 'v'},
@@ -6069,6 +6758,43 @@ static cp_type *cp_typecode(cp_parser *p, char code)
     return 0;
 }
 
+// The type code of __builtin_<name>: the table, then the C library's
+// math functions, whose f and l forms return float and long double.
+static char cp_builtincode(cp_str name)
+{
+    for (iz i = 0; i < cp_countof(cp_builtins); i++) {
+        if (cp_equals(name, cp_cstr(cp_builtins[i].name))) return cp_builtins[i].code;
+    }
+    static const char *const math[] = {
+        "acos", "asin", "atan", "atan2", "cos", "sin", "tan", "cosh", "sinh",
+        "tanh", "acosh", "asinh", "atanh", "exp", "exp2", "expm1", "exp10",
+        "log", "log10", "log2", "log1p", "logb", "pow", "cbrt", "hypot",
+        "fmod", "remainder", "remquo", "floor", "ceil", "round", "roundeven",
+        "trunc", "rint", "nearbyint", "fmin", "fmax", "fdim", "fma", "ldexp",
+        "frexp", "scalbn", "scalbln", "modf", "erf", "erfc", "tgamma",
+        "lgamma", "nextafter", "nexttoward", "significand", "drem",
+    };
+    static const struct { char *name; char code; } ints[] = {
+        {"ilogb", 'i'}, {"lround", 'l'}, {"llround", 'q'}, {"lrint", 'l'},
+        {"llrint", 'q'},
+    };
+    for (iz i = 0; i < cp_countof(math); i++) {
+        cp_str m = cp_cstr((char *)math[i]);
+        if (!cp_startswith(name, m)) continue;
+        if (name.len == m.len) return 'd';
+        if (name.len == m.len+1 && name.data[m.len] == 'f') return 'f';
+        if (name.len == m.len+1 && name.data[m.len] == 'l') return 'D';
+    }
+    for (iz i = 0; i < cp_countof(ints); i++) {
+        cp_str m = cp_cstr(ints[i].name);
+        if (cp_startswith(name, m) && name.len <= m.len+1 &&
+            (name.len == m.len || name.data[m.len] == 'f' || name.data[m.len] == 'l')) {
+            return ints[i].code;
+        }
+    }
+    return 0;
+}
+
 static cp_sym *cp_implicitfunc(cp_parser *p, cp_node *id)
 {
     cp_str name = id->text;
@@ -6077,13 +6803,9 @@ static cp_sym *cp_implicitfunc(cp_parser *p, cp_node *id)
                   cp_startswith(name, S("__atomic_"));
     if (cp_startswith(name, S("__builtin_"))) {
         cp_str rest = cp_span(name.data+10, name.data+name.len);
-        for (iz i = 0; i < cp_countof(cp_builtins); i++) {
-            if (cp_equals(rest, cp_cstr(cp_builtins[i].name))) {
-                cp_type *t = cp_typecode(p, cp_builtins[i].code);
-                if (t) ret = t;
-                break;
-            }
-        }
+        char code = cp_builtincode(rest);
+        cp_type *t = code ? cp_typecode(p, code) : 0;
+        if (t) ret = t;
     } else if (!builtin) {
         cp_warn(p, id->tok, cp_concat(p->mem, S("implicit declaration of function "), name));
     }
@@ -6151,6 +6873,7 @@ static cp_node *cp_strlit(cp_parser *p)
         while (s < e) {
             b32 raw;
             u32 c;
+            if (!rawstr && (s = cp_skipsplices(s, e)) >= e) break;
             if (rawstr) {
                 c = (u8)*s++;
                 raw = 1;
@@ -6291,6 +7014,8 @@ static void cp_typefloat(cp_parser *p, cp_node *n)
     else if (k) cp_warn(p, n->tok, cp_concat(p->mem, S("invalid floating constant "), s));
     n->ty = imag ? p->cbt[bt] : p->bt[bt];
     if (!imag) n->isconst = 2;
+    // a float constant has float's precision: 3.14f != 3.14
+    if (bt == CP_BT_FLOAT || bt == CP_BT_FLOAT32) n->fval = (double)(float)n->fval;
 }
 
 static void cp_typechar(cp_parser *p, cp_node *n)
@@ -6409,10 +7134,20 @@ static b32 cp_addrconst(cp_node *e, i64 *v)
     return 0;
 }
 
+// Constants are held in 64 bits: an unsigned value of 2^63 or more,
+// stored negative, cannot widen to a 128-bit type without becoming a
+// different number, so it is left unknown there.
+static b32 cp_widenlost(cp_parser *p, cp_type *to, cp_node *a)
+{
+    return to && to->size > 8 && a->isconst == 1 && a->cval < 0 && a->ty &&
+           cp_isinteger(a->ty) && a->ty->size <= 8 && cp_isunsigned(p, a->ty);
+}
+
 static void cp_constcast(cp_parser *p, cp_node *n, cp_node *a)
 {
     cp_type *t = n->ty;
     if (!t || !a) return;
+    if (cp_widenlost(p, t, a)) return;
     if (cp_isinteger(t) || cp_isptr(t)) {
         if (a->isconst == 1) {
             n->isconst = 1;
@@ -6544,6 +7279,11 @@ static cp_node *cp_generic(cp_parser *p)
     return n;
 }
 
+static cp_node *cp_parsetypename(cp_parser *p)
+{
+    return cp_parsetypename2(p, 0);
+}
+
 static cp_node *cp_blocklit(cp_parser *p)
 {
     cp_node *n = cp_newnode(p, CP_E_BLOCK, p->pos);
@@ -6551,13 +7291,16 @@ static cp_node *cp_blocklit(cp_parser *p)
     cp_type *fn;
     p->fnscope = 0;
     if (cp_kind(p) == CP_LPAREN) {
+        n->ival = 1;  // ^(params)
         fn = cp_syntype(p, CP_T_FUNC, p->pos);
         cp_params(p, fn);
         fn->base = cp_syntype(p, CP_T_IMPLICIT, p->pos);
         fn->base->bits = CP_B_VOID;
         cp_resolvebase(p, fn->base);
     } else if (cp_kind(p) != CP_LBRACE) {
-        cp_node *tn = cp_parsetypename(p);
+        cp_node *tn = cp_parsetypename2(p, 1);
+        n->ival = 2;  // ^ type, kept in b with its attributes
+        n->b = tn;
         fn = tn->type;
         if (fn->kind != CP_T_FUNC) {
             cp_type *f = cp_syntype(p, CP_T_FUNC, p->pos);
@@ -6658,9 +7401,30 @@ static cp_node *cp_call(cp_parser *p, cp_node *fnexpr)
             "__atomic_store_n", "__atomic_load", "__atomic_exchange",
             "__atomic_clear", "__atomic_thread_fence", "__atomic_signal_fence",
         };
+        // the sized forms (__atomic_exchange_4, __sync_fetch_and_add_8)
+        // return an unsigned integer of that size, whatever ptr points to
+        i32 size = 0;
+        static const char *sizes[] = {"_1", "_2", "_4", "_8", "_16"};
+        for (iz i = 0; i < cp_countof(sizes); i++) {
+            cp_str suf = cp_cstr((char *)sizes[i]);
+            if (w.len > suf.len && cp_equals(cp_span(w.data+w.len-suf.len, w.data+w.len), suf)) {
+                size = i == 4 ? 16 : 1 << i;
+                w.len -= suf.len;
+            }
+        }
         for (iz i = 0; i < cp_countof(bools); i++) isbool |= cp_equals(w, cp_cstr((char *)bools[i]));
         for (iz i = 0; i < cp_countof(voids); i++) isvoid |= cp_equals(w, cp_cstr((char *)voids[i]));
-        if (isbool) {
+        if (size) {
+            // the generic __atomic_exchange and __atomic_load return
+            // through a pointer, their sized forms by value
+            isvoid = cp_equals(w, S("__atomic_store")) || cp_equals(w, S("__sync_lock_release"));
+        }
+        if (size && !isbool && !isvoid) {
+            i32 bt = size == 1 ? CP_BT_UCHAR : size == 2 ? CP_BT_USHORT : size == 4 ? CP_BT_UINT :
+                     size == 16 ? CP_BT_UINT128 :
+                     p->bt[CP_BT_ULONG]->size == 8 ? CP_BT_ULONG : CP_BT_ULLONG;
+            n->ty = p->bt[bt];
+        } else if (isbool) {
             n->ty = p->bt[CP_BT_BOOL];
         } else if (isvoid) {
             n->ty = p->bt[CP_BT_VOID];
@@ -6671,15 +7435,8 @@ static cp_node *cp_call(cp_parser *p, cp_node *fnexpr)
     }
     if (builtin) {
         cp_str name = cp_span(fnexpr->text.data+10, fnexpr->text.data+fnexpr->text.len);
-        char code = 0;
-        b32 known = 0;
-        for (iz i = 0; i < cp_countof(cp_builtins); i++) {
-            if (cp_equals(name, cp_cstr(cp_builtins[i].name))) {
-                code = cp_builtins[i].code;
-                known = 1;
-                break;
-            }
-        }
+        char code = cp_builtincode(name);
+        b32 known = code != 0;
         // A builtin missing from the table (the hundreds of target
         // intrinsics such as __builtin_ia32_addps) has a type we do not
         // know: leave it unknown rather than guess int.
@@ -6687,6 +7444,22 @@ static cp_node *cp_call(cp_parser *p, cp_node *fnexpr)
         switch (code) {
         case 'a': if (a0) n->ty = cp_decay(p, a0->ty); break;
         case 'T': if (a0) n->ty = a0->ty; break;
+        case 'S': {
+            // __builtin_shufflevector(a, b, i...): the element type of a,
+            // as many elements as indices
+            cp_type *v = a0 && a0->ty ? a0->ty->sem : 0;
+            i64 count = 0;
+            for (cp_node *x = a1 ? a1->next : 0; x; x = x->next) count++;
+            if (v && v->kind == CP_T_VECTOR && v->base && count > 0) {
+                cp_type *r = cp_mktype(p, CP_T_VECTOR);
+                r->base = v->base;
+                r->len = count;
+                r->size = count * v->base->size;
+                r->align = r->size > 0 && r->size <= 64 && !(r->size & (r->size-1)) ? r->size : 16;
+                n->ty = r;
+            }
+            break;
+        }
         case 'U': if (a1) n->ty = a1->ty; break;
         case 'K': if (a0 && a0->ty && a0->ty->kind == CP_T_BUILTIN) n->ty = p->cbt[a0->ty->basic]; break;
         case 'X':
@@ -7122,6 +7895,7 @@ static void cp_foldbinary(cp_parser *p, cp_node *n)
         cp_type *ct = (op == CP_SHL || op == CP_SHR) ? n->ty :
                       (op >= CP_LT && op <= CP_NE) ? cp_uac(p, a->ty, b->ty) : n->ty;
         if (!cp_isinteger(ct)) ct = n->ty;
+        if (cp_widenlost(p, ct, a) || cp_widenlost(p, ct, b)) return;
         b32 uns = cp_isunsigned(p, ct) && ct->kind != CP_T_POINTER;
         i64 x = a->cval, y = b->cval;
         if (cp_isinteger(ct)) { x = cp_truncate(p, ct, x); y = op == CP_SHL || op == CP_SHR ? y : cp_truncate(p, ct, y); }
@@ -7197,6 +7971,28 @@ static void cp_foldbinary(cp_parser *p, cp_node *n)
         case CP_OROR: r = x || y; break;
         default: return;
         }
+        if (ct->size > 8 && n->ty->kind != CP_T_POINTER) {
+            // values are held in 64 bits: a 128-bit result that does not
+            // fit is no known constant, rather than a wrong one
+            b32 over = 0;
+            switch (op) {
+            case CP_STAR:
+                over = uns ? ux && (u64)r / ux != uy :
+                             x && ((x == -1 && y == INT64_MIN) || (y == -1 && x == INT64_MIN) ||
+                                   r / x != y);
+                break;
+            case CP_PLUS:
+                over = uns ? (u64)r < ux : (x > 0 && y > 0 && r < 0) || (x < 0 && y < 0 && r >= 0);
+                break;
+            case CP_MINUS:
+                over = uns ? ux < uy : (x >= 0 && y < 0 && r < 0) || (x < 0 && y > 0 && r >= 0);
+                break;
+            case CP_SHL:
+                over = y > 0 && (uns ? ux >> (64 - y) : ux >> (63 - y)) != 0;
+                break;
+            }
+            if (over) return;
+        }
         n->isconst = 1;
         n->cval = n->ty->kind == CP_T_POINTER ? r : cp_truncate(p, n->ty, r);
         return;
@@ -7220,8 +8016,8 @@ static void cp_foldbinary(cp_parser *p, cp_node *n)
         case CP_GE: ir = x >= y; isint = 1; break;
         case CP_EQ: ir = x == y; isint = 1; break;
         case CP_NE: ir = x != y; isint = 1; break;
-        case CP_ANDAND: ir = x && y; isint = 1; break;
-        case CP_OROR: ir = x || y; isint = 1; break;
+        case CP_ANDAND: ir = x != 0 && y != 0; isint = 1; break;
+        case CP_OROR: ir = x != 0 || y != 0; isint = 1; break;
         default: return;
         }
         if (isint) { n->isconst = 1; n->cval = ir; }
@@ -7248,18 +8044,18 @@ static cp_type *cp_optype(cp_parser *p, cp_node *e)
     return cp_decay(p, e->ty);
 }
 
-// The type of comparing vectors of type v: as GCC has it, a vector of
-// signed integers as wide as v's elements (float vectors included), with
-// long preferred over long long where both fit.
+// The type of comparing vectors of type v: a vector of signed integers as
+// wide as v's elements (float vectors included). GCC spells them signed
+// char and long where long fits; Clang char and long long.
 static cp_type *cp_vectorcmp(cp_parser *p, cp_type *v)
 {
     if (!v->base || v->base->size <= 0) return v;
     i32 bt;
     switch (v->base->size) {
-    case 1:  bt = CP_BT_SCHAR; break;
+    case 1:  bt = p->clang ? CP_BT_CHAR : CP_BT_SCHAR; break;
     case 2:  bt = CP_BT_SHORT; break;
     case 4:  bt = CP_BT_INT; break;
-    case 8:  bt = p->bt[CP_BT_LONG]->size == 8 ? CP_BT_LONG : CP_BT_LLONG; break;
+    case 8:  bt = !p->clang && p->bt[CP_BT_LONG]->size == 8 ? CP_BT_LONG : CP_BT_LLONG; break;
     case 16: bt = CP_BT_INT128; break;
     default: return v;
     }
@@ -7547,7 +8343,8 @@ static cp_node *cp_label(cp_parser *p)
     n->text = cp_tok(p)->text;
     cp_next(p);
     cp_next(p);  // :
-    cp_attrs(p, &n->attrs);
+    // GNU attributes here are the label's; "L: [[x]] s" gives [[x]] to s
+    if (cp_kind(p) != CP_LBRACK) cp_attrs(p, &n->attrs);
     if (p->curfunc || p->labels || p->scope->depth > 0) {
         cp_map *m = cp_upsert(&p->labels, n->text, p->mem);
         if (m->val) {
@@ -7650,6 +8447,12 @@ static cp_node *cp_msasm(cp_parser *p)
     } else {
         while (cp_kind(p) != CP_EOF && cp_kind(p) != CP_RBRACE && cp_kind(p) != CP_K_ASM &&
                cp_tok(p)->line == line && cp_tok(p)->file == file) {
+            cp_token *t = cp_tok(p);
+            if (t->kind == CP_OTHER && t->text.len && (t->text.data[0] == '"' || t->text.data[0] == '\'')) {
+                // the printer must break the line after a stray quote,
+                // which would end the instruction early
+                cp_fail(p, "unterminated literal in __asm");
+            }
             cp_next(p);
         }
         cp_accept(p, CP_SEMI);
@@ -7845,7 +8648,12 @@ static cp_node *cp_stmt(cp_parser *p)
                 cp_attr *at = 0;
                 cp_attrs(p, &at);
                 n = cp_stmt(p);
-                cp_attrappend(&n->attrs, at);
+                if (n->kind == CP_S_LABEL) {
+                    // "[[x]] L: s": printed before the label again
+                    for (cp_attr *a = at; a; a = a->next) a->before = 1;
+                }
+                cp_attrappend(&at, n->attrs);
+                n->attrs = at;
                 n->tok = tok;
                 break;
             }
@@ -8055,7 +8863,13 @@ static cp_node *cp_declaration(cp_parser *p, i32 ctx)
     cp_node *tail = &head;
     b32 first = 1;
     for (;;) {
+        // attributes before a later declarator belong to it:
+        // "static T a = {...}, __attribute__((deprecated)) b = {...};"
+        cp_attr *lead = 0;
+        if (!first) cp_attrs(p, &lead);
         cp_node *d = cp_newdeclarator(p, sp.type);
+        cp_attrappend(&lead, d->attrs);
+        d->attrs = lead;
         cp_scope *fnscope = p->fnscope;
         // trailing attributes and asm labels
         for (;;) {
@@ -8071,6 +8885,7 @@ static cp_node *cp_declaration(cp_parser *p, i32 ctx)
         ai.mode = -1;
         cp_scanattrs(p, sp.attrs, &ai);
         cp_scanattrs(p, d->attrs, &ai);
+        cp_scanabi(p, d->type, &ai);
         ty = cp_applytypeattrs(p, ty, &ai);
         if ((sp.storage & CP_SC_TYPEDEF) && ai.aligned) ty = cp_realign(p, ty, ai.aligned);
         d->ty = ty;
@@ -8089,6 +8904,13 @@ static cp_node *cp_declaration(cp_parser *p, i32 ctx)
         if (cp_accept(p, CP_ASSIGN)) {
             d->a = cp_initializer(p);
             cp_type *nt = cp_completearray(p, d->ty, d->a);
+            cp_type *prior = d->sym ? d->sym->ty : 0;
+            if (d->ty && d->ty->kind == CP_T_ARRAY && d->ty->len < 0 && prior &&
+                prior->kind == CP_T_ARRAY && prior->len >= 0) {
+                // "extern int a[10]; int a[] = {1, 2};" is int[10]: the
+                // composite with the earlier declaration
+                nt = prior;
+            }
             if ((sp.type->kind == CP_T_AUTOTYPE || (sp.type->kind == CP_T_IMPLICIT &&
                  (sp.storage & CP_SC_AUTO))) && d->type == sp.type && d->a->ty) {
                 nt = cp_decay(p, d->a->ty);
@@ -8304,7 +9126,20 @@ cp_unit *cp_parse(cp_arena *arena, cp_str src, cp_str filename, cp_config *cfg)
         pp->predefs = 0;
         pp->ls.keepcomments = 1;
         pp->cond = 0;
+    } else if (cfg->predefs.len) {
+        // Already preprocessed: nothing is expanded, but the compiler's
+        // macros still say what it targets (C version, long double), so
+        // their definitions are read. Their #includes are already in.
+        pp->predefs = 1;
+        pp->noinclude = 1;
+        pp->ls.keepcomments = 0;
+        cp_ppmain(pp, cp_lexfile(&pp->ls, cfg->predefs, predeffile));
+        pp->predefs = 0;
+        pp->noinclude = 0;
+        pp->ls.keepcomments = 1;
+        pp->cond = 0;
     }
+    pp->nopp = cfg && cfg->nopp;
     pp->depth = 1;
     cp_ppmain(pp, cp_lexfile(&pp->ls, pp->files[mainfile].src, mainfile));
     for (cp_cond *c = pp->cond; c; c = c->next) {
@@ -8329,6 +9164,11 @@ cp_unit *cp_parse(cp_arena *arena, cp_str src, cp_str filename, cp_config *cfg)
             d->exp = t->exp;
             d->macro = t->macro;
             d->doc = t->doc;
+            if (t->kind == CP_OTHER && t->text.len && (t->text.data[0] == '"' || t->text.data[0] == '\'')) {
+                // a raw token run (attribute, asm, error region) would
+                // print it, and the stray quote would swallow what follows
+                cp_diag(diags, 0, i, t->file, t->line, t->col, cp_cstr("missing terminating quote"));
+            }
             last = t;
         }
         toks[n].kind = CP_EOF;
@@ -8364,10 +9204,32 @@ cp_unit *cp_parse(cp_arena *arena, cp_str src, cp_str filename, cp_config *cfg)
         // __builtin_va_list
         cp_type *va;
         if (p->target == CP_TARGET_LP64) {
+            // the x86-64 System V va_list, fields as GCC declares them
             cp_type *tag = cp_mktype(p, CP_T_STRUCT);
             tag->name = cp_cstr("__va_list_tag");
+            tag->tok = -1;  // built in: no source, and no spelling of its own
             tag->size = 24;
             tag->align = 8;
+            static const struct { char *name; i32 off; b32 ptr; } fields[] = {
+                {"gp_offset", 0, 0}, {"fp_offset", 4, 0},
+                {"overflow_arg_area", 8, 1}, {"reg_save_area", 16, 1},
+            };
+            cp_node **tail = &tag->members;
+            for (iz i = 0; i < cp_countof(fields); i++) {
+                cp_node *decl = cp_new(p->mem, 1, cp_node);
+                cp_node *d = cp_new(p->mem, 1, cp_node);
+                decl->kind = CP_D_DECL;
+                decl->tok = d->tok = -1;
+                decl->list = d;
+                d->kind = CP_D_DECLARATOR;
+                d->text = cp_cstr(fields[i].name);
+                d->ty = fields[i].ptr ? p->voidptr : p->bt[CP_BT_UINT];
+                d->offset = fields[i].off;
+                d->bitoffset = fields[i].off * 8;
+                d->bitwidth = -1;
+                *tail = decl;
+                tail = &decl->next;
+            }
             va = cp_arrayof(p, tag, 1);
         } else {
             va = cp_ptrto(p, p->bt[CP_BT_CHAR]);
@@ -8430,6 +9292,8 @@ typedef struct {
     i32      lastnum;    // last token was a number
     i32      nextpragma;
     b32      check;      // emit type assertions (cp_print_checked)
+    cp_attr *nameattrs;  // printed after the next declarator name
+    i32      widthpass;  // 1: attributes before a bit-field width, 2: after
 } cp_out;
 
 static void cp_putc(cp_out *o, char c)
@@ -8554,19 +9418,23 @@ static void cp_flushpragmas(cp_out *o, i32 tok)
 
 static void cp_pattrs(cp_out *o, cp_attr *a, i32 which)
 {
-    // which: 0 all, 1 only before-attrs, 2 only after-attrs, 3 std only,
-    // 4 all but std and after-type, 5 only after-type, 6 the kinds a
-    // definition may take among its specifiers, 7 the others
+    // which: 0 all, 1 only before-attrs, 2 only after-attrs, 3 std and
+    // leading macros, 4 all but those and after-type, 5 only after-type, 6 the kinds a
+    // definition may take among its specifiers, 7 the others, 8 all but
+    // after-type
     for (; a; a = a->next) {
+        if ((which == 9) != (a->aftername != 0)) continue;  // 9: after the name only
+        if (o->widthpass && (o->widthpass == 2) != (a->afterwidth != 0)) continue;
         b32 movable = a->kind == CP_A_GNU || a->kind == CP_A_DECLSPEC || a->kind == CP_A_ALIGNAS;
         if (which == 6 && !movable) continue;
         if (which == 7 && movable) continue;
         if (which == 4 && a->aftertype) continue;
         if (which == 5 && !a->aftertype) continue;
+        if (which == 8 && a->aftertype) continue;
         if (which == 1 && !a->before) continue;
         if (which == 2 && a->before) continue;
-        if (which == 3 && a->kind != CP_A_STD) continue;
-        if (which == 4 && a->kind == CP_A_STD) continue;
+        if (which == 3 && ((a->kind != CP_A_STD && !a->leading) || a->aftertype)) continue;
+        if (which == 4 && (a->kind == CP_A_STD || a->leading)) continue;
         cp_sp(o);
         cp_ptoks(o, a->beg, a->end, 0);
     }
@@ -8704,8 +9572,8 @@ static void cp_pbase(cp_out *o, cp_type *t)
         cp_sp(o);
         cp_tkc(o, t->kind == CP_T_STRUCT ? "struct" : t->kind == CP_T_UNION ? "union" : "enum");
         if (sem) {
-            if (cp_equals(t->name, S("__va_list_tag")) && !t->members) {
-                // no spelling of its own: reach it through va_list
+            if (cp_equals(t->name, S("__va_list_tag")) && t->tok < 0) {
+                // the built-in one has no spelling: reach it through va_list
                 o->len -= 6;
                 cp_puts(o, S("__typeof__(((__builtin_va_list *)0)[0][0])"));
                 break;
@@ -8862,6 +9730,8 @@ static void cp_pdeclarator(cp_out *o, cp_type *t, cp_type *stop, cp_str name, b3
     if (hasname && name.len) {
         if (o->last != '*' && o->last != '^') cp_sp(o);
         cp_tk(o, name);
+        cp_pattrs(o, o->nameattrs, 9);
+        o->nameattrs = 0;
     }
     cp_psuffix(o, t, stop);
 }
@@ -8873,11 +9743,14 @@ static void cp_ptypename(cp_out *o, cp_type *t, cp_type *stop);
 // (__attribute__((vector_size(16))) int){...} is a vector.
 static void cp_pexprtype(cp_out *o, cp_node *n)
 {
-    if (n->attrs) {
-        cp_pattrs(o, n->attrs, 0);
-        cp_sp(o);
-    }
-    cp_ptypename(o, n->type, 0);
+    // attributes keep their side of the type: "int [[x]] *" is not
+    // "[[x]] int *", which is no type name at all
+    if (!n->type) { cp_tkc(o, "int"); return; }
+    cp_pattrs(o, n->attrs, 8);
+    cp_type *base = cp_innermost(n->type, 0);
+    cp_pbase(o, base);
+    cp_pattrs(o, n->attrs, 5);
+    cp_pdeclarator(o, n->type, base, S(""), 0);
 }
 
 // A type name: base plus abstract declarator. stop is the base for
@@ -8925,13 +9798,20 @@ static void cp_pspecs(cp_out *o, i32 storage, cp_attr *attrs, cp_type *base)
 
 static void cp_pdeclarator1(cp_out *o, cp_node *d, cp_type *base, b32 moveattrs)
 {
+    o->nameattrs = d->attrs;
     cp_pdeclarator(o, d->type, base, d->text, 1);
+    o->nameattrs = 0;
     if (d->b) {
+        // annotations stay on their side of the width: in "unsigned long
+        // FOO x : 3" FOO is the name and x an annotation
+        o->widthpass = 1;
+        cp_pattrs(o, d->attrs, moveattrs ? 7 : 0);
         cp_puts(o, S(" : "));
         cp_pexpr(o, d->b, 3);
+        o->widthpass = 2;
     }
-    if (!moveattrs) cp_pattrs(o, d->attrs, 0);
-    else cp_pattrs(o, d->attrs, 7);
+    cp_pattrs(o, d->attrs, moveattrs ? 7 : 0);
+    o->widthpass = 0;
     if (d->a) {
         cp_puts(o, S(" = "));
         cp_pinit(o, d->a);
@@ -9171,16 +10051,11 @@ static void cp_pexpr(cp_out *o, cp_node *n, i32 prec)
         break;
     case CP_E_BLOCK: {
         cp_tkc(o, "^");
-        cp_type *ft = n->type;
-        if (ft && ft->kind == CP_T_FUNC) {
-            cp_type *rt = ft->base;
-            b32 voidret = rt && (rt->kind == CP_T_IMPLICIT || rt->kind == CP_T_BUILTIN) &&
-                          rt->bits == CP_B_VOID && rt->tok == ft->tok;
-            if (!voidret && rt) {
-                cp_ptypename(o, rt, 0);
-            }
-            if (ft->params || (ft->flags & CP_TF_VARIADIC)) cp_pparams(o, ft);
-            else if (!voidret) cp_pparams(o, ft);
+        if (n->ival == 1 && n->type) {
+            cp_pparams(o, n->type);
+        } else if (n->ival == 2 && n->b) {
+            cp_sp(o);
+            cp_pexprtype(o, n->b);
         }
         cp_sp(o);
         cp_pstmt(o, n->a);
@@ -9189,6 +10064,61 @@ static void cp_pexpr(cp_out *o, cp_node *n, i32 prec)
         cp_tkc(o, "/*?*/");
     }
     if (paren) cp_tkc(o, ")");
+}
+
+// Clang's library builtins: functions its headers declare but whose type
+// it will not let typeof take ("builtin functions must be directly called").
+static b32 cp_tcclangbuiltin(cp_unit *u, cp_str name)
+{
+    static const char *const names[] = {
+        "_mm_getcsr", "_mm_setcsr", "_mm_sfence", "_mm_lfence", "_mm_mfence",
+        "_mm_pause", "_mm_clflush", "_mm_prefetch", "__rdtsc",
+    };
+    b32 listed = 0;
+    for (iz i = 0; i < cp_countof(names); i++) listed |= cp_equals(name, cp_cstr((char *)names[i]));
+    if (!listed) return 0;
+    for (cp_macro *m = u->macros; m; m = m->next) {
+        if (cp_equals(m->name, S("__clang__"))) return 1;
+    }
+    return 0;
+}
+
+// Does a type contain a function reached through a noreturn pointer?
+// GCC types those differently from Clang and the standard, so --typecheck
+// asserts nothing about them.
+// Is there a variable length array anywhere along the type?
+static b32 cp_tcvla(cp_type *t)
+{
+    for (i32 depth = 0; t && depth < 32; t = t->base, depth++) {
+        if (t->flags & CP_TF_VLA) return 1;
+    }
+    return 0;
+}
+
+// Does a type mention a tag declared only in a parameter list?
+static b32 cp_tcprototag(cp_type *t, i32 depth)
+{
+    for (; t && depth < 32; t = t->base, depth++) {
+        if ((t->unqual ? t->unqual : t)->flags & CP_TF_PROTOTAG) return 1;
+        if (t->kind != CP_T_FUNC) continue;
+        for (i32 i = 0; i < t->nargs; i++) {
+            if (cp_tcprototag(t->args[i], depth+1)) return 1;
+        }
+    }
+    return 0;
+}
+
+static b32 cp_tcnoreturn(cp_type *t, i32 depth)  // also ms_abi/sysv_abi
+{
+    for (; t && depth < 32; t = t->base, depth++) {
+        if (t->kind == CP_T_FUNC) {
+            if (t->flags & (CP_TF_NORETURN|CP_TF_ABI)) return 1;
+            for (i32 i = 0; i < t->nargs; i++) {
+                if (cp_tcnoreturn(t->args[i], depth+1)) return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static b32 cp_tcskip(cp_node *e)
@@ -9202,12 +10132,32 @@ static b32 cp_tcskip(cp_node *e)
     return 0;
 }
 
+static b32 cp_tcunsafe(cp_node *e, i32 depth);
+
+// Does a written type define a struct, union or enum ("enum {A}")? Then
+// an expression holding it cannot be repeated: the second copy would
+// declare it again. Or is it typeof an expression that cannot be checked
+// (a wide bit-field, whose GCC type C cannot spell)?
+static b32 cp_tcdefines(cp_type *t, i32 depth)
+{
+    for (; t && depth < 32; t = t->base, depth++) {
+        if ((t->kind == CP_T_STRUCT || t->kind == CP_T_UNION || t->kind == CP_T_ENUM) && t->members) return 1;
+        if (t->kind == CP_T_TYPEOF && t->expr && cp_tcunsafe(t->expr, depth+1)) return 1;
+        if (t->kind != CP_T_FUNC) continue;
+        for (cp_node *prm = t->params; prm; prm = prm->next) {
+            if (cp_tcdefines(prm->type, depth+1)) return 1;
+        }
+    }
+    return 0;
+}
+
 static b32 cp_tcunsafe(cp_node *e, i32 depth)
 {
     // Expressions that must not be duplicated into typeof, or whose GCC
     // types are internal (wide bit-fields).
     if (!e || depth > 200) return e != 0;
     if (e->kind == CP_E_STMTEXPR || e->kind == CP_E_BLOCK) return 1;
+    if (e->type && cp_tcdefines(e->type, 0)) return 1;
     if (e->kind == CP_E_MEMBER && e->ref && e->ref->bitwidth > 32) return 1;
     if ((e->kind == CP_E_ASSIGN || e->kind == CP_E_POSTFIX ||
          (e->kind == CP_E_UNARY && (e->op == CP_INC || e->op == CP_DEC))) &&
@@ -9223,7 +10173,8 @@ static b32 cp_tcunsafe(cp_node *e, i32 depth)
     if (cp_tcunsafe(e->a, depth+1) || cp_tcunsafe(e->b, depth+1) || cp_tcunsafe(e->c, depth+1)) return 1;
     if (e->kind == CP_E_CALL || e->kind == CP_E_GENERIC) {
         for (cp_node *x = e->list; x; x = x->next) {
-            if (x->kind != CP_E_TYPEARG && cp_tcunsafe(x->kind == CP_E_ASSOC ? x->a : x, depth+1)) return 1;
+            if (x->kind == CP_E_TYPEARG ? x->type && cp_tcdefines(x->type, 0) :
+                cp_tcunsafe(x->kind == CP_E_ASSOC ? x->a : x, depth+1)) return 1;
         }
     }
     return 0;
@@ -9254,6 +10205,10 @@ static void cp_tcexpr(cp_out *o, cp_node *e, i32 depth)
     if (cp_tcunsafe(e, 0)) return;
     if (e->kind == CP_E_MEMBER && e->ref && e->ref->bitwidth >= 0) return;
     if (e->kind == CP_E_IDENT && e->sym && (e->sym->flags & CP_YF_IMPLICIT)) return;
+    if (e->kind == CP_E_IDENT && cp_tcclangbuiltin(o->u, e->text)) return;
+    if (cp_tcnoreturn(e->ty, 0)) return;
+    if (cp_tcprototag(e->ty, 0)) return;
+    if (cp_tcvla(e->ty)) return;
     if ((e->kind == CP_E_ASSIGN || e->kind == CP_E_POSTFIX ||
          (e->kind == CP_E_UNARY && (e->op == CP_INC || e->op == CP_DEC))) &&
         e->a && e->a->kind == CP_E_MEMBER && e->a->ref && e->a->ref->bitwidth >= 0) {
@@ -9297,6 +10252,10 @@ static void cp_tcdecl(cp_out *o, cp_node *n)
     for (cp_node *d = n->list; d; d = d->next) {
         if (d->a) cp_tcexpr(o, d->a, 0);
         if (!d->text.len || !d->ty || (n->flags & CP_SC_TYPEDEF) || d->bitwidth >= 0) continue;
+        if (cp_tcclangbuiltin(o->u, d->text)) continue;
+        if (cp_tcnoreturn(d->ty, 0)) continue;  // GCC's own variant type
+        if (cp_tcprototag(d->ty, 0)) continue;  // its tag cannot be named
+        if (cp_tcvla(d->ty)) continue;  // "int[n][m]" has no spelling here
         iz mark = o->len;
         cp_nl(o);
         cp_ind(o);
@@ -9315,6 +10274,25 @@ static void cp_tcdecl(cp_out *o, cp_node *n)
     }
 }
 
+// Up to which token the pragmas before statement s are printed ahead of
+// it. A --typecheck wrapper "{ loop; asserts }" takes the loop's own
+// pragmas inside, or the brace would part a loop pragma from its loop.
+static i32 cp_pragmasbefore(cp_out *o, cp_node *s)
+{
+    b32 wrapped = o->check && (s->kind == CP_S_WHILE || s->kind == CP_S_DO);
+    return wrapped ? s->tok - 1 : s->tok;
+}
+
+// A statement on a line of its own, after the pragmas that come before it
+// (a loop pragma must stay right before its loop, even under a label).
+static void cp_pnested(cp_out *o, cp_node *s)
+{
+    if (s) cp_flushpragmas(o, cp_pragmasbefore(o, s));
+    cp_nl(o);
+    cp_ind(o);
+    cp_pstmt(o, s);
+}
+
 static void cp_pbody(cp_out *o, cp_node *s)
 {
     // statement after if/while/for: compound on the same line
@@ -9323,9 +10301,7 @@ static void cp_pbody(cp_out *o, cp_node *s)
         cp_pstmt(o, s);
     } else {
         o->indent++;
-        cp_nl(o);
-        cp_ind(o);
-        cp_pstmt(o, s);
+        cp_pnested(o, s);
         o->indent--;
     }
 }
@@ -9340,6 +10316,7 @@ static void cp_pstmt(cp_out *o, cp_node *n)
     case CP_S_WHILE: case CP_S_DO:
         cp_tkc(o, "{");
         cp_sp(o);
+        cp_flushpragmas(o, n->tok);  // a loop's pragmas, inside the wrapper
         cp_pstmt1(o, n);
         o->indent++;
         if (n->kind == CP_S_EXPR || n->kind == CP_S_RETURN) cp_tcexpr(o, n->a, 0);
@@ -9370,7 +10347,7 @@ static void cp_pstmt1(cp_out *o, cp_node *n)
         cp_tkc(o, "{");
         o->indent++;
         for (cp_node *s = n->list; s; s = s->next) {
-            cp_flushpragmas(o, s->tok);
+            cp_flushpragmas(o, cp_pragmasbefore(o, s));
             cp_nl(o);
             cp_ind(o);
             cp_pstmt(o, s);
@@ -9466,29 +10443,36 @@ static void cp_pstmt1(cp_out *o, cp_node *n)
         cp_tkc(o, ";");
         break;
     case CP_S_LABEL:
+    {
+        b32 lead = 0, trail = 0;
+        for (cp_attr *a = n->attrs; a; a = a->next) {
+            lead |= a->before;
+            trail |= !a->before;
+        }
+        if (lead) {
+            cp_pattrs(o, n->attrs, 1);
+            cp_sp(o);
+        }
         cp_tk(o, n->text);
         cp_tkc(o, ":");
-        cp_pattrs(o, n->attrs, 0);
+        cp_pattrs(o, n->attrs, 2);
         // "label: attr;" ends with the semicolon that a reparse reads as a
         // null statement, so a null statement there is already printed
-        if (n->attrs) cp_tkc(o, ";");
-        if (n->a && !(n->attrs && n->a->kind == CP_S_NULL)) {
-            cp_nl(o);
-            cp_ind(o);
-            cp_pstmt(o, n->a);
-        }
+        if (trail) cp_tkc(o, ";");
+        if (n->a && !(trail && n->a->kind == CP_S_NULL)) cp_pnested(o, n->a);
         break;
+    }
     case CP_S_CASE:
         cp_tkc(o, "case");
         cp_sp(o);
         cp_pexpr(o, n->a, 3);
         if (n->b) { cp_puts(o, S(" ... ")); cp_pexpr(o, n->b, 3); }
         cp_tkc(o, ":");
-        if (n->c) { cp_nl(o); cp_ind(o); cp_pstmt(o, n->c); }
+        if (n->c) cp_pnested(o, n->c);
         break;
     case CP_S_DEFAULT:
         cp_tkc(o, "default:");
-        if (n->c) { cp_nl(o); cp_ind(o); cp_pstmt(o, n->c); }
+        if (n->c) cp_pnested(o, n->c);
         break;
     case CP_S_ASM: {
         cp_tkc(o, "__asm__");
@@ -9862,6 +10846,709 @@ cp_str cp_nodename(int32_t kind)
     if (kind >= 0 && kind < CP_NNODEKINDS && names[kind]) return cp_cstr((char *)names[kind]);
     return S("?");
 }
+
+// ---- Convenience
+
+// Arena allocation for the public helpers: null instead of a longjmp when
+// the arena is full.
+static void *cp_arenanew(cp_arena *a, iz count, iz size, iz align)
+{
+    iz pad = -(uintptr_t)a->beg & (uintptr_t)(align - 1);
+    if (count < 0 || count > (a->end - a->beg - pad)/size) return 0;
+    char *r = a->beg + pad;
+    a->beg += pad + count*size;
+    cp_memset0(r, count*size);
+    return r;
+}
+
+static cp_token *cp_nodetok(cp_unit *u, cp_node *n)
+{
+    return u && n && n->tok >= 0 && n->tok < u->ntoks ? &u->toks[n->tok] : 0;
+}
+
+cp_loc cp_locof(cp_unit *u, cp_node *n)
+{
+    cp_loc r = {0};
+    cp_token *t = cp_nodetok(u, n);
+    if (!t) return r;
+    if (t->file >= 0 && t->file < u->nfiles) r.file = u->files[t->file].path;
+    r.line = t->line;
+    r.col = t->col;
+    return r;
+}
+
+cp_str cp_locstr(cp_arena *a, cp_unit *u, cp_node *n)
+{
+    cp_loc l = cp_locof(u, n);
+    cp_out o = cp_outbegin(a, u);
+    cp_puts(&o, l.file.data ? l.file : S("?"));
+    cp_putc(&o, ':');
+    cp_num(&o, l.line);
+    cp_putc(&o, ':');
+    o.lastnum = 0;
+    cp_num(&o, l.col);
+    return cp_outend(a, &o);
+}
+
+cp_str cp_srcof(cp_unit *u, cp_node *n)
+{
+    cp_str r = {0};
+    cp_token *b = cp_nodetok(u, n);
+    if (!b || n->endtok <= n->tok || n->endtok > u->ntoks) return r;
+    cp_token *e = &u->toks[n->endtok - 1];
+    if (b->macro || e->macro || b->file != e->file || b->file < 0 || b->file >= u->nfiles) return r;
+    cp_str src = u->files[b->file].src;
+    char *beg = b->text.data, *end = e->text.data + e->text.len;
+    if (beg < src.data || end > src.data + src.len || end < beg) return r;
+    return cp_span(beg, end);
+}
+
+cp_str cp_docof(cp_unit *u, cp_node *n)
+{
+    cp_token *t = cp_nodetok(u, n);
+    return t ? t->doc : (cp_str){0};
+}
+
+// The token where a symbol is first declared.
+static cp_token *cp_symtok(cp_unit *u, cp_sym *s)
+{
+    if (!u || !s) return 0;
+    i32 tok = s->decl ? s->decl->tok : s->kind == CP_SYM_TAG && s->ty ? s->ty->tok : -1;
+    return tok >= 0 && tok < u->ntoks ? &u->toks[tok] : 0;
+}
+
+cp_loc cp_symloc(cp_unit *u, cp_sym *s)
+{
+    cp_loc r = {0};
+    cp_token *t = cp_symtok(u, s);
+    if (!t) return r;
+    if (t->file >= 0 && t->file < u->nfiles) r.file = u->files[t->file].path;
+    r.line = t->line;
+    r.col = t->col;
+    return r;
+}
+
+cp_str cp_symdoc(cp_unit *u, cp_sym *s)
+{
+    cp_token *t = cp_symtok(u, s);
+    if (!t) return (cp_str){0};
+    if (t->doc.len || !s->ty || s->kind != CP_SYM_TAG) return t->doc;
+    // a tag's type points at its name; the comment sits before "struct"
+    cp_token *k = t - 1;
+    return k >= u->toks ? k->doc : t->doc;
+}
+
+int32_t cp_inmainfile(cp_unit *u, cp_node *n)
+{
+    cp_token *t = cp_nodetok(u, n);
+    return t && t->file == 0;
+}
+
+cp_macro *cp_macroof(cp_unit *u, cp_node *n)
+{
+    cp_token *t = cp_nodetok(u, n);
+    return t ? t->macro : 0;
+}
+
+cp_str cp_nodestr(cp_arena *a, cp_unit *u, cp_node *n)
+{
+    cp_out o = cp_outbegin(a, u);
+    if (u) o.nextpragma = (i32)u->npragmas;  // a fragment: no pragmas
+    if (!n) {
+    } else if (n->kind < CP_S_COMPOUND) {
+        cp_pexpr(&o, n, 1);
+    } else if (n->kind == CP_D_DECLARATOR) {
+        cp_type *base = cp_innermost(n->type, 0);
+        cp_pbase(&o, base);
+        cp_pdeclarator(&o, n->type, base, n->text, 1);
+    } else {
+        cp_pstmt(&o, n);
+    }
+    if (o.len && o.buf[0] == ' ') {
+        for (iz i = 0; i+1 < o.len; i++) o.buf[i] = o.buf[i+1];
+        o.len--;
+    }
+    return cp_outend(a, &o);
+}
+
+cp_sym *cp_findsym(cp_unit *u, cp_str name)
+{
+    for (cp_sym *s = u ? u->syms : 0; s; s = s->next) {
+        if (s->depth == 0 && s->kind != CP_SYM_TAG && s->kind != CP_SYM_LABEL &&
+            cp_equals(s->name, name)) {
+            return s;
+        }
+    }
+    return 0;
+}
+
+cp_sym *cp_findtag(cp_unit *u, cp_str name)
+{
+    cp_sym *r = 0;
+    for (cp_sym *s = u ? u->syms : 0; s; s = s->next) {
+        if (s->depth == 0 && s->kind == CP_SYM_TAG && cp_equals(s->name, name)) {
+            r = s;
+            if (s->ty && !(s->ty->flags & CP_TF_INCOMPLETE)) break;  // prefer complete
+        }
+    }
+    return r;
+}
+
+cp_macro *cp_macrodef(cp_unit *u, cp_str name)
+{
+    cp_macro *r = 0;
+    for (cp_macro *m = u ? u->macros : 0; m; m = m->next) {
+        if (cp_equals(m->name, name)) r = m;
+    }
+    return r;
+}
+
+cp_sym *cp_nextsym(cp_unit *u, cp_sym *prev, int32_t kinds, int32_t sel)
+{
+    for (cp_sym *s = prev ? prev->next : u ? u->syms : 0; s; s = s->next) {
+        if (kinds && !(kinds & CP_KIND(s->kind))) continue;
+        cp_token *t = cp_symtok(u, s);
+        if ((sel & CP_SEL_MAIN) && !(t && t->file == 0)) continue;
+        if ((sel & CP_SEL_DEFINED) && !s->def && !(s->flags & CP_YF_DEFINED)) continue;
+        if ((sel & CP_SEL_FILE) && s->depth != 0) continue;
+        if ((sel & CP_SEL_EXTERNAL) && s->linkage != CP_LINK_EXTERNAL) continue;
+        if ((sel & CP_SEL_USED) && !s->refs) continue;
+        return s;
+    }
+    return 0;
+}
+
+cp_str cp_declstr(cp_arena *a, cp_unit *u, cp_type *t, cp_str name)
+{
+    cp_out o = cp_outbegin(a, u);
+    if (t) {
+        cp_type *base = cp_innermost(t, 0);
+        cp_pbase(&o, base);
+        cp_pdeclarator(&o, t, base, name, name.len > 0);
+    }
+    if (o.len && o.buf[0] == ' ') {
+        for (iz i = 0; i+1 < o.len; i++) o.buf[i] = o.buf[i+1];
+        o.len--;
+    }
+    return cp_outend(a, &o);
+}
+
+cp_str cp_signature(cp_arena *a, cp_unit *u, cp_sym *f)
+{
+    if (!f) return cp_declstr(a, u, 0, S(""));
+    cp_node *d = 0;
+    i32 storage = 0;
+    if (f->def && f->def->kind == CP_D_FUNC) {
+        d = f->def->list;
+        storage = f->def->flags & (CP_SC_STATIC|CP_SC_EXTERN|CP_SC_INLINE|CP_SC_NORETURN);
+    } else if (f->decl && f->decl->kind == CP_D_DECLARATOR) {
+        d = f->decl;
+    }
+    if (!d || !d->type) return cp_declstr(a, u, f->ty, f->name);
+    cp_out o = cp_outbegin(a, u);
+    cp_pstorage(&o, storage);
+    cp_type *base = cp_innermost(d->type, 0);
+    cp_pbase(&o, base);
+    cp_pdeclarator(&o, d->type, base, d->text, 1);
+    if (o.len && o.buf[0] == ' ') {
+        for (iz i = 0; i+1 < o.len; i++) o.buf[i] = o.buf[i+1];
+        o.len--;
+    }
+    return cp_outend(a, &o);
+}
+
+// Visit the named fields of record t at offset base; count them, and store
+// them when out is not null.
+static i32 cp_fieldsat(cp_type *t, i64 base, cp_field *out, i32 n, i32 depth)
+{
+    if (!t || depth > 64) return n;
+    for (cp_node *decl = t->members; decl; decl = decl->next) {
+        if (decl->kind != CP_D_DECL) continue;
+        if (decl->eflags & CP_EF_ANONMEMBER) {
+            n = cp_fieldsat(decl->type->sem, base + decl->offset, out, n, depth+1);
+            continue;
+        }
+        for (cp_node *d = decl->list; d; d = d->next) {
+            if (!d->text.len) continue;
+            if (out) {
+                cp_field *f = out + n;
+                f->name = d->text;
+                f->type = d->ty;
+                f->offset = base + d->offset;
+                f->bitoffset = base*8 + d->bitoffset;
+                f->bitwidth = d->bitwidth;
+                f->decl = d;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+int32_t cp_fields(cp_arena *a, cp_type *t, cp_field **out)
+{
+    *out = 0;
+    t = cp_strip(t);
+    if (!t || (t->kind != CP_T_STRUCT && t->kind != CP_T_UNION)) return 0;
+    i32 n = cp_fieldsat(t, 0, 0, 0, 0);
+    if (!n) return 0;
+    cp_field *f = cp_arenanew(a, n, (iz)sizeof(cp_field), (iz)cp_alignof(cp_field));
+    if (!f) return -1;
+    cp_fieldsat(t, 0, f, 0, 0);
+    *out = f;
+    return n;
+}
+
+int32_t cp_enumconsts(cp_arena *a, cp_type *t, cp_enumconst **out)
+{
+    *out = 0;
+    t = cp_strip(t);
+    if (!t || t->kind != CP_T_ENUM) return 0;
+    i32 n = 0;
+    for (cp_node *e = t->members; e; e = e->next) n += e->kind == CP_D_ENUMERATOR;
+    if (!n) return 0;
+    cp_enumconst *r = cp_arenanew(a, n, (iz)sizeof(cp_enumconst), (iz)cp_alignof(cp_enumconst));
+    if (!r) return -1;
+    i32 i = 0;
+    for (cp_node *e = t->members; e; e = e->next) {
+        if (e->kind != CP_D_ENUMERATOR) continue;
+        r[i].name = e->text;
+        r[i].value = e->cval;
+        r[i].decl = e;
+        i++;
+    }
+    *out = r;
+    return n;
+}
+
+// Returns -1 when the walk is to stop.
+static i32 cp_walk1(cp_node *n, cp_node *parent, cp_visitor visit, void *ctx, i32 depth)
+{
+    if (!n || depth > CPARSE_MAXDEPTH*4) return 1;
+    i32 r = visit(ctx, n, parent);
+    if (r < 0) return -1;
+    if (r == 0) return 1;
+    cp_node *kids[] = {n->a, n->b, n->c, n->d};
+    for (iz i = 0; i < cp_countof(kids); i++) {
+        if (cp_walk1(kids[i], n, visit, ctx, depth+1) < 0) return -1;
+    }
+    for (cp_node *k = n->list; k; k = k->next) {
+        if (cp_walk1(k, n, visit, ctx, depth+1) < 0) return -1;
+    }
+    return 1;
+}
+
+void cp_walk(cp_node *root, cp_visitor visit, void *ctx)
+{
+    if (visit) cp_walk1(root, 0, visit, ctx, 0);
+}
+
+void cp_walkunit(cp_unit *u, cp_visitor visit, void *ctx)
+{
+    for (cp_node *d = u && visit ? u->decls : 0; d; d = d->next) {
+        if (cp_walk1(d, 0, visit, ctx, 0) < 0) return;
+    }
+}
+
+cp_sym *cp_callee(cp_node *call)
+{
+    if (!call || call->kind != CP_E_CALL || !call->a) return 0;
+    cp_node *f = call->a;
+    if (f->kind == CP_E_UNARY && f->op == CP_STAR && f->a) f = f->a;  // (*f)(x)
+    return f->kind == CP_E_IDENT && f->sym && f->sym->kind == CP_SYM_FUNC ? f->sym : 0;
+}
+
+cp_symref *cp_callsto(cp_unit *u, cp_str name)
+{
+    cp_sym *s = cp_findsym(u, name);
+    return s && s->kind == CP_SYM_FUNC ? s->callers : 0;
+}
+
+cp_type *cp_strip(cp_type *t)
+{
+    if (!t) return 0;
+    t = t->sem ? t->sem : t;
+    return t->unqual ? t->unqual : t;
+}
+
+cp_type *cp_target(cp_type *t)
+{
+    t = cp_strip(t);
+    if (!t) return 0;
+    switch (t->kind) {
+    case CP_T_POINTER: case CP_T_ARRAY: case CP_T_VECTOR: case CP_T_FUNC:
+        return t->base;
+    }
+    return 0;
+}
+
+int32_t cp_typeis(cp_type *t, int32_t what)
+{
+    if (!t) return 0;
+    cp_type *q = t->sem ? t->sem : t;  // keeps qualifiers
+    cp_type *s = cp_strip(t);
+    b32 isint = cp_isinteger(s);
+    b32 isuns = 0;
+    if (isint) {
+        cp_type *b = s->kind == CP_T_ENUM ? cp_strip(s->base) : s;
+        if (b && b->kind == CP_T_BITINT) isuns = (b->bits & CP_B_UNSIGNED) != 0;
+        else if (b && b->kind == CP_T_BUILTIN) {
+            switch (b->basic) {
+            case CP_BT_BOOL: case CP_BT_UCHAR: case CP_BT_USHORT: case CP_BT_UINT:
+            case CP_BT_ULONG: case CP_BT_ULLONG: case CP_BT_UINT128:
+                isuns = 1;
+            }
+        }
+    }
+    struct { i32 flag; b32 has; } props[] = {
+        {CP_IS_VOID,     s->kind == CP_T_BUILTIN && s->basic == CP_BT_VOID},
+        {CP_IS_BOOL,     s->kind == CP_T_BUILTIN && s->basic == CP_BT_BOOL},
+        {CP_IS_INTEGER,  isint},
+        {CP_IS_FLOATING, cp_isfloating(s)},
+        {CP_IS_ARITH,    cp_isarith(s)},
+        {CP_IS_SCALAR,   cp_isscalar(s)},
+        {CP_IS_POINTER,  s->kind == CP_T_POINTER},
+        {CP_IS_ARRAY,    s->kind == CP_T_ARRAY},
+        {CP_IS_FUNC,     s->kind == CP_T_FUNC},
+        {CP_IS_STRUCT,   s->kind == CP_T_STRUCT},
+        {CP_IS_UNION,    s->kind == CP_T_UNION},
+        {CP_IS_RECORD,   s->kind == CP_T_STRUCT || s->kind == CP_T_UNION},
+        {CP_IS_ENUM,     s->kind == CP_T_ENUM},
+        {CP_IS_SIGNED,   (isint && !isuns) || cp_isfloating(s)},
+        {CP_IS_UNSIGNED, isint && isuns},
+        {CP_IS_CONST,    (q->quals & CP_Q_CONST) != 0},
+        {CP_IS_VOLATILE, (q->quals & CP_Q_VOLATILE) != 0},
+        {CP_IS_COMPLETE, s->size >= 0 && !(s->flags & CP_TF_INCOMPLETE)},
+        {CP_IS_VECTOR,   s->kind == CP_T_VECTOR},
+        {CP_IS_VARIADIC, s->kind == CP_T_FUNC && (s->flags & CP_TF_VARIADIC)},
+    };
+    for (iz i = 0; i < cp_countof(props); i++) {
+        if ((what & props[i].flag) && !props[i].has) return 0;
+    }
+    return what != 0;
+}
+
+int32_t cp_constint(cp_node *e, int64_t *value)
+{
+    if (!e || e->isconst != 1) return 0;
+    if (value) *value = e->cval;
+    return 1;
+}
+
+cp_str cp_errorstr(cp_arena *a, cp_error *e)
+{
+    cp_out o = cp_outbegin(a, 0);
+    if (e) {
+        cp_puts(&o, e->file.data ? e->file : S("?"));
+        cp_putc(&o, ':');
+        cp_num(&o, e->line);
+        cp_putc(&o, ':');
+        o.lastnum = 0;
+        cp_num(&o, e->col);
+        cp_puts(&o, e->warning ? S(": warning: ") : S(": error: "));
+        cp_puts(&o, e->msg);
+    }
+    return cp_outend(a, &o);
+}
+
+#ifdef CPARSE_HOSTED
+// ---- Hosted helpers: the only part of the library that does I/O.
+#ifdef _WIN32
+#  define cp_popen  _popen
+#  define cp_pclose _pclose
+#  define cp_devnull "NUL"
+#else
+// POSIX, declared here so they are available whatever feature macros the
+// includer used
+FILE *popen(const char *, const char *);
+int pclose(FILE *);
+char *realpath(const char *, char *);
+#  define cp_popen  popen
+#  define cp_pclose pclose
+#  define cp_devnull "/dev/null"
+#endif
+
+cp_arena cp_newarena(ptrdiff_t cap)
+{
+    cp_arena a = {0};
+    char *mem = cap > 0 ? malloc((size_t)cap) : 0;
+    if (mem) {
+        a.beg = mem;
+        a.end = mem + cap;
+    }
+    return a;
+}
+
+// A copy of s with a terminating null, in the arena, or a null string.
+static cp_str cp_hdup(cp_arena *a, cp_str s)
+{
+    cp_str r = {0};
+    char *d = cp_arenanew(a, s.len+1, 1, 1);
+    if (!d) return r;
+    cp_memcpy(d, s.data, s.len);
+    d[s.len] = 0;
+    r.data = d;
+    r.len = s.len;
+    return r;
+}
+
+// Append s to the growing string *dst (which must be the arena's last
+// allocation, or empty). False when the arena is full.
+static b32 cp_hcat(cp_arena *a, cp_str *dst, cp_str s)
+{
+    if (!dst->data) {
+        *dst = cp_hdup(a, s);
+        return dst->data != 0;
+    }
+    if (dst->data + dst->len + 1 != a->beg) {  // not last: copy first
+        cp_str c = cp_hdup(a, *dst);
+        if (!c.data) return 0;
+        *dst = c;
+    }
+    if (s.len >= a->end - a->beg) return 0;
+    cp_memcpy(dst->data + dst->len, s.data, s.len);
+    dst->len += s.len;
+    dst->data[dst->len] = 0;
+    a->beg = dst->data + dst->len + 1;
+    return 1;
+}
+
+cp_str cp_readfile(void *ctx, cp_str path, cp_arena *a)
+{
+    (void)ctx;
+    cp_str r = {0};
+    char name[4096];
+    if (path.len <= 0 || path.len >= (iz)sizeof(name)) return r;
+    cp_memcpy(name, path.data, path.len);
+    name[path.len] = 0;
+    FILE *f = fopen(name, "rb");
+    if (!f) return r;
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return r; }
+    long n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET) || n >= a->end - a->beg) { fclose(f); return r; }
+    r.data = a->beg;
+    r.len = (iz)fread(r.data, 1, (size_t)n, f);
+    fclose(f);
+    if (r.len != n) return (cp_str){0};  // a directory opens but reads nothing
+    r.data[r.len] = 0;
+    a->beg += r.len + 1;
+    return r;
+}
+
+// Run a shell command and capture its output in the arena.
+static cp_str cp_hrun(cp_arena *a, cp_str cmd)
+{
+    cp_str r = {0};
+    if (!cmd.data) return r;
+    FILE *f = cp_popen(cmd.data, "r");
+    if (!f) return r;
+    r.data = a->beg;
+    iz cap = a->end - a->beg - 1;
+    for (;;) {
+        size_t n = fread(r.data + r.len, 1, (size_t)(cap - r.len), f);
+        if (!n) break;
+        r.len += (iz)n;
+    }
+    cp_pclose(f);
+    r.data[r.len] = 0;
+    a->beg += r.len + 1;
+    return r;
+}
+
+static b32 cp_hstartswith(char *s, char *prefix)
+{
+    for (; *prefix; s++, prefix++) {
+        if (*s != *prefix) return 0;
+    }
+    return 1;
+}
+
+static b32 cp_hequal(char *s, char *t)
+{
+    return cp_hstartswith(s, t) && s[cp_cstr(t).len] == 0;
+}
+
+// Does "cc -dM" output define name?
+static b32 cp_hdefines(cp_str predefs, char *name)
+{
+    iz n = cp_cstr(name).len;
+    for (iz i = 0; i+8+n < predefs.len; i++) {
+        char *p = predefs.data + i;
+        if (cp_hstartswith(p, "#define ") && cp_equals(cp_span(p+8, p+8+n), cp_cstr(name)) &&
+            p[8+n] == ' ') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// A growable list of directory strings in the arena.
+typedef struct { cp_str *data; i32 len, cap; } cp_hdirs;
+
+static b32 cp_hpush(cp_arena *a, cp_hdirs *l, cp_str s)
+{
+    if (l->len == l->cap) {
+        i32 cap = l->cap ? l->cap*2 : 16;
+        cp_str *d = cp_arenanew(a, cap, (iz)sizeof(cp_str), (iz)cp_alignof(cp_str));
+        if (!d) return 0;
+        if (l->len) cp_memcpy(d, l->data, l->len*(iz)sizeof(cp_str));
+        l->data = d;
+        l->cap = cap;
+    }
+    l->data[l->len++] = s;
+    return 1;
+}
+
+cp_config *cp_hostconfig(cp_arena *a, int argc, char **argv)
+{
+    cp_config *cfg = cp_arenanew(a, 1, (iz)sizeof(cp_config), (iz)cp_alignof(cp_config));
+    if (!cfg) return 0;
+    cfg->readfile = cp_readfile;
+    // like GCC, honor SOURCE_DATE_EPOCH for reproducible builds
+    // (UTC); otherwise local time, as GCC uses
+    char *epoch = getenv("SOURCE_DATE_EPOCH");
+    if (epoch) {
+        cfg->time = strtoll(epoch, 0, 10);
+    } else {
+        time_t now = time(0);
+        struct tm g = *gmtime(&now);
+        g.tm_isdst = -1;
+        cfg->time = (int64_t)now + (int64_t)(now - mktime(&g));  // UTC offset
+    }
+    cp_hdirs quote = {0}, inc = {0}, sys = {0};
+    cp_str defines = {0}, ccflags = S(" "), cc = S("cc");
+    b32 nostdinc = 0, ok = 1;
+    for (int i = 0; i < argc && ok; i++) {
+        char *o = argv[i];
+        char *next = i+1 < argc ? argv[i+1] : 0;
+        char *v = 0;  // option value
+        if (o[0] != '-') continue;  // file names are the caller's
+        if (cp_hstartswith(o, "-I")) {
+            v = o[2] ? o+2 : (i++, next);
+            if (v) ok = cp_hpush(a, &inc, cp_cstr(v));
+        } else if (cp_hequal(o, "-isystem") && next) {
+            ok = cp_hpush(a, &sys, cp_cstr(argv[++i]));
+        } else if (cp_hequal(o, "-iquote") && next) {
+            ok = cp_hpush(a, &quote, cp_cstr(argv[++i]));
+        } else if (cp_hstartswith(o, "-D") || cp_hstartswith(o, "-U")) {
+            v = o[2] ? o+2 : (i++, next);
+            if (!v) continue;
+            cp_str d = cp_cstr(v), eq = {0};
+            for (iz k = 0; k < d.len; k++) {
+                if (d.data[k] == '=') { eq = cp_span(d.data+k+1, d.data+d.len); d.len = k; break; }
+            }
+            ok = cp_hcat(a, &defines, o[1] == 'D' ? S("#define ") : S("#undef ")) &&
+                 cp_hcat(a, &defines, d) &&
+                 (o[1] == 'U' || cp_hcat(a, &defines, eq.data ? S(" ") : S(" 1"))) &&
+                 cp_hcat(a, &defines, eq) && cp_hcat(a, &defines, S("\n"));
+        } else if (cp_hequal(o, "-include") && next) {
+            // as if the main file began with #include "FILE"
+            char *path = argv[++i];
+#ifndef _WIN32
+            char *full = realpath(path, 0);
+#else
+            char *full = _fullpath(0, path, 0);
+#endif
+            ok = cp_hcat(a, &defines, S("#include \"")) &&
+                 cp_hcat(a, &defines, cp_cstr(full ? full : path)) &&
+                 cp_hcat(a, &defines, S("\"\n"));
+            free(full);
+        } else if (cp_hequal(o, "--cc") && next) {
+            cc = cp_cstr(argv[++i]);
+        } else if (cp_hequal(o, "--std") && next) {
+            ok = cp_hcat(a, &ccflags, S(" -std=")) && cp_hcat(a, &ccflags, cp_cstr(argv[++i]));
+        } else if (cp_hstartswith(o, "-std=") || cp_hstartswith(o, "-O") ||
+                   cp_hstartswith(o, "-m") || (cp_hstartswith(o, "-f") && o[2])) {
+            // flags that change the compiler's predefined macros
+            ok = cp_hcat(a, &ccflags, S(" ")) && cp_hcat(a, &ccflags, cp_cstr(o));
+            if (cp_hstartswith(o, "-std=")) {
+                // ISO modes before C23 have trigraphs, GNU modes do not
+                char *s = o + 5;
+                cfg->trigraphs = (s[0] == 'c' && !cp_hstartswith(s, "c2")) ||
+                                 (cp_hstartswith(s, "iso9899:") && !cp_hequal(s, "iso9899:2024"));
+            }
+        } else if (cp_hequal(o, "-trigraphs")) {
+            cfg->trigraphs = 1;
+        } else if (cp_hequal(o, "--target") && next) {
+            char *t = argv[++i];
+            cfg->target = cp_hequal(t, "llp64") ? CP_TARGET_LLP64 :
+                          cp_hequal(t, "ilp32") ? CP_TARGET_ILP32 : CP_TARGET_LP64;
+        } else if (cp_hequal(o, "--nopp")) {
+            cfg->nopp = 1;
+        } else if (cp_hequal(o, "-nostdinc") || cp_hequal(o, "--nostdinc")) {
+            nostdinc = 1;
+        } else if (cp_hequal(o, "-o") || cp_hequal(o, "-x") || cp_hequal(o, "--xref")) {
+            i++;  // options with a value that is not a file
+        }
+    }
+    if (!ok) return 0;
+
+    // the compiler's predefined macros and include directories
+    cp_str predefs = {0};
+    if (!cfg->nopp && !cp_equals(cc, S("none"))) {
+        cp_str cmd = {0};
+        ok = cp_hcat(a, &cmd, cc) && cp_hcat(a, &cmd, ccflags) &&
+             cp_hcat(a, &cmd, S(" -dM -E -x c " cp_devnull " 2>" cp_devnull));
+        if (!ok) return 0;
+        predefs = cp_hrun(a, cmd);
+        cmd = (cp_str){0};
+        ok = cp_hcat(a, &cmd, cc) && cp_hcat(a, &cmd, ccflags) &&
+             cp_hcat(a, &cmd, S(" -E -v -x c " cp_devnull " 2>&1 >" cp_devnull));
+        if (!ok) return 0;
+        cp_str out = cp_hrun(a, cmd);
+        // the lines between "#include <...> search starts here:" and
+        // "End of search list."
+        b32 in = 0;
+        for (iz k = 0; k < out.len && !nostdinc;) {
+            iz e = k;
+            while (e < out.len && out.data[e] != '\n') e++;
+            cp_str line = cp_span(out.data+k, out.data+e);
+            if (cp_startswith(line, S("#include <"))) {
+                in = 1;
+            } else if (cp_startswith(line, S("End"))) {
+                in = 0;
+            } else if (in && line.len > 1 && line.data[0] == ' ') {
+                cp_str d = cp_span(line.data+1, line.data+line.len);
+                for (iz m = 0; m < d.len; m++) {
+                    if (d.data[m] == ' ') { d.len = m; break; }  // "(framework directory)"
+                }
+                if (!cp_hpush(a, &sys, cp_hdup(a, d))) return 0;
+            }
+            k = e + 1;
+        }
+        // GCC's predefined assertions, which "cc -dM" cannot report
+        if (cp_hdefines(predefs, "__x86_64__")) {
+            ok = cp_hcat(a, &predefs, S("#assert cpu(x86_64)\n#assert machine(x86_64)\n"));
+        } else if (cp_hdefines(predefs, "__i386__")) {
+            ok = cp_hcat(a, &predefs, S("#assert cpu(i386)\n#assert machine(i386)\n"));
+        }
+        if (ok && cp_hdefines(predefs, "__linux__")) {
+            ok = cp_hcat(a, &predefs, S("#assert system(linux)\n#assert system(unix)\n"
+                                        "#assert system(posix)\n"));
+        }
+        if (!ok) return 0;
+    }
+    if (defines.data && !cp_hcat(a, &predefs, defines)) return 0;
+    cfg->predefs = predefs;
+    cfg->quotedirs = quote.data;   cfg->nquotedirs = quote.len;
+    cfg->includedirs = inc.data;   cfg->nincludedirs = inc.len;
+    cfg->systemdirs = sys.data;    cfg->nsystemdirs = sys.len;
+    return cfg;
+}
+
+cp_unit *cp_parsefile(cp_arena *a, char const *path, int argc, char **argv)
+{
+    cp_config *cfg = cp_hostconfig(a, argc, argv);
+    if (!cfg) return 0;
+    cp_str name = cp_hdup(a, cp_cstr((char *)path));
+    cp_str src = cp_readfile(0, name, a);
+    if (!name.data || !src.data) return 0;
+    return cp_parse(a, src, name, cfg);
+}
+#undef cp_popen
+#undef cp_pclose
+#undef cp_devnull
+#endif  // CPARSE_HOSTED
 
 #undef i8
 #undef i32

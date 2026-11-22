@@ -9,6 +9,7 @@
 /fuzz/out/
 /corpus/dl/
 /corpus/src/
+/corpus/wild/
 /corpus/results*.txt
 /corpus/musl-sample.txt
 

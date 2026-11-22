@@ -12,6 +12,8 @@ for f in gnu c23; do
 done
 r=$(tests/check1.sh tests/cases/kr.c -std=gnu89 -fpermissive)
 case "$r" in *"parse=ok round=ok object=ok types=ok"*) note kr.c ok;; *) note kr.c "$r";; esac
+r=$(tests/check1.sh tests/cases/atomics.c)
+case "$r" in *"parse=ok round=ok object=ok types=ok"*) note atomics.c ok;; *) note atomics.c "$r";; esac
 r=$(tests/check1.sh tests/cases/simd.c -mavx2 -mfma)
 case "$r" in *"parse=ok round=ok object=ok types=ok"*) note simd.c ok;; *) note simd.c "$r";; esac
 
@@ -50,6 +52,33 @@ for f in msvc blocks embedded missing; do
     else note $f.c ok; fi
 done
 
+# the convenience and hosted helpers, built strictly and under sanitizers
+t=$(mktemp -d "${TMPDIR:-/tmp}/cpapi.XXXXXX")
+if cc -std=c99 -pedantic -Wall -Wextra -Wno-unused-function -Werror -c -o $t/api.o tests/api.c 2>$t/err &&
+   cc -std=c99 -g -fsanitize=address,undefined -o $t/api tests/api.c 2>>$t/err &&
+   ASAN_OPTIONS=detect_leaks=0 $t/api > $t/out 2>&1; then
+    note "api.c helpers" ok
+else
+    note "api.c helpers" "$(head -3 $t/err $t/out | tr '\n' ' ')"
+fi
+rm -rf "$t"
+
+# the example programs: build strictly, run on the helper test's input
+t=$(mktemp -d "${TMPDIR:-/tmp}/cpex.XXXXXX")
+r=ok
+for e in functions calls structs unused; do
+    cc -std=c99 -pedantic -Wall -Wextra -Wno-unused-function -Werror -o $t/$e examples/$e.c 2>/dev/null ||
+        { r="examples/$e.c does not build"; break; }
+done
+if [ "$r" = ok ]; then
+    $t/functions tests/cases/api_input.c | grep -q 'int area(struct shape \*s, int scale, ...)' || r=functions
+    $t/calls malloc tests/cases/api_input.c 2>/dev/null | grep -q 'in dup_point: malloc(sizeof(\*q))' || r=calls
+    $t/structs tests/cases/api_input.c | grep -q '7 bytes of padding' || r=structs
+    $t/unused tests/cases/api_input.c >/dev/null || r=unused
+fi
+rm -rf "$t"
+note "examples" "$r"
+
 # symbol uses and call graph: against the hand-checked expected output
 r=$(for n in g h k m arr ptr s fp callee helper use; do ./cparse --cc none --xref $n tests/cases/symbols.c 2>/dev/null; done
     ./cparse --cc none --callgraph tests/cases/symbols.c 2>/dev/null)
@@ -85,6 +114,9 @@ if gcc -m32 -x c -c /dev/null -o /dev/null 2>/dev/null; then
         CC="gcc -m32" CPARSEFLAGS="--target ilp32" python3 tests/layoutfuzz.py 300 $s >/dev/null ||
             { note "ilp32 layout seed $s" "mismatch"; lf=bad; }
     done
+    # seed 9102 holds a full-width long long bit-field with aligned(1)
+    CC="gcc -m32" CPARSEFLAGS="--target ilp32" python3 tests/layoutfuzz.py 3000 9102 >/dev/null ||
+        { note "ilp32 layout seed 9102" "mismatch"; lf=bad; }
     [ $lf = ok ] && note "layout fuzz ilp32 (gcc -m32)" ok
 fi
 if command -v x86_64-w64-mingw32-gcc >/dev/null; then

@@ -37,3 +37,17 @@ int f15(int a UNUSED_ARG(a), char *fmt) FORMAT(printf, 2, 3);
 int WINAPI_LIKE f16(void);
 kr1(a, b) int a; char *b; { return a + *b; }
 int kr2(x) handle_t x; { return 0; }
+/* annotation macros keep their place: around a bit-field width, before
+ * the storage class, and in runs after a declarator */
+struct bf1 { unsigned FOO_A long x : 3; unsigned y : 4 PACKED_A; unsigned z PACKED_B : 5; };
+EXPORT_A static int lead1;
+void trail1(void) NORETURN_A PRINTF_A(1, 2);
+extern __attribute__((stdcall)) void trail2(void) ATTR_A ATTR_B(x);
+vpid __ptr64 *ptr64a;
+/* annotation macros before a known typedef name, a qualifier or an
+ * attribute, and between storage classes */
+typedef int known_t;
+API_B known_t ann1(void);
+API_C const known_t *ann2;
+API_D __attribute__((unused)) static int ann3;
+typedef API_E unsigned ann4;

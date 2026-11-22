@@ -50,7 +50,8 @@ instead of null-terminated ones, signed sizes, no I/O, and no libc beyond
 
 The preprocessor handles:
 
-- `#include` and `#include_next`, `#pragma once`, include guards;
+- `#include`, `#include_next` and `#import`, `#pragma once` (by path,
+  or by name and contents as GCC does), include guards;
 - `#if` with `defined`, `__has_include` and `__has_attribute`, and
   `__has_builtin`, `__has_feature` and `__has_extension` answered as GCC
   or Clang does for the configured compiler, target and language standard;
@@ -58,7 +59,10 @@ The preprocessor handles:
 - `#` and `##`, `_Pragma`, `push_macro`/`pop_macro`, `#embed`;
 - trigraphs, in ISO modes before C23 (`-std=c99`) or with `-trigraphs`;
 - GCC's obsolete assertions (`#assert`, `#unassert`, `#if #machine(x86)`);
-- line markers, so already-preprocessed input works too.
+- `#line`, with macros in its operands, and line markers, so
+  already-preprocessed input works too;
+- `__DATE__` and `__TIME__` from `cp_config.time`, which the hosted part
+  sets from the clock or `SOURCE_DATE_EPOCH`, as GCC does.
 
 Where an identifier was never declared, for example because a header is
 missing, cparse guesses what it must be from where it stands:
@@ -66,8 +70,10 @@ missing, cparse guesses what it must be from where it stands:
 - a type name, when only a type fits (`foo_t x;`, `(foo_t *)p`);
 - an attribute-like macro, when only an annotation fits
   (`EXPORT int f(void);`, `int WINAPI f(void);`, `void f(void) NORETURN;`,
-  `int x UNUSED;`, `int a ALIGNED(16);`, `f(EV_P_ struct ev_io *w)`). It is
-  kept in the tree as an attribute, so the declaration keeps its true type.
+  `int x UNUSED;`, `int a ALIGNED(16);`, `f(EV_P_ struct ev_io *w)`,
+  `API size_t f(void);` and runs like `void f(void) NORETURN PRINTF(1, 2);`).
+  It is kept in the tree as an attribute, so the declaration keeps its true
+  type.
 
 Each guess is reported as a warning. This lets cparse parse code whose
 headers aren't available.
@@ -187,29 +193,70 @@ Options:
 
 ## Using the library
 
+The quickest start parses a file as a compiler would. Define
+`CPARSE_HOSTED` along with `CPARSE_IMPLEMENTATION` for the helpers that
+read files and ask the compiler for its settings:
+
 ```c
 #define CPARSE_IMPLEMENTATION
+#define CPARSE_HOSTED
 #include "cparse.h"
 
-static cp_str readfile(void *ctx, cp_str path, cp_arena *perm);  // yours
-
-cp_arena  a   = {mem, mem + cap};
-cp_config cfg = {0};
-cfg.readfile    = readfile;
-cfg.systemdirs  = dirs;  cfg.nsystemdirs = ndirs;
-cfg.predefs     = predefined_macros;   // e.g. output of: cc -dM -E - </dev/null
-cp_unit *u = cp_parse(&a, src, CP_STR("main.c"), &cfg);
-
-for (cp_sym *s = u->syms; s; s = s->next) {
-    cp_str type = cp_typename(&a, u, s->ty);
-    ...
+int main(int argc, char **argv)
+{
+    cp_arena a = cp_newarena((ptrdiff_t)1 << 30);
+    cp_unit *u = cp_parsefile(&a, argv[1], argc-2, argv+2);  // -I, -D, --cc, ...
+    for (cp_error *e = u->errors; e; e = e->next) {
+        puts(cp_errorstr(&a, e).data);
+    }
+    // every function defined in the file, with its signature
+    for (cp_sym *f = 0; (f = cp_nextsym(u, f, CP_KIND(CP_SYM_FUNC), CP_SEL_MAIN|CP_SEL_DEFINED));) {
+        printf("%s: %s\n", cp_locstr(&a, u, f->def).data, cp_signature(&a, u, f).data);
+    }
 }
 ```
 
-The library never allocates on its own and never does I/O. Everything it
-returns lives in the arena you pass, so freeing that arena frees it all.
-If the arena runs out, the unit comes back marked `oom` with whatever was
+Without `CPARSE_HOSTED` the library never allocates on its own and never
+does I/O: the caller supplies the arena and a callback that reads files.
+
+```c
+cp_arena  a   = {mem, mem + cap};
+cp_config cfg = {0};
+cfg.readfile    = readfile;   // yours; or cp_readfile from the hosted part
+cfg.systemdirs  = dirs;  cfg.nsystemdirs = ndirs;
+cfg.predefs     = predefined_macros;   // e.g. output of: cc -dM -E - </dev/null
+cp_unit *u = cp_parse(&a, src, CP_STR("main.c"), &cfg);
+```
+
+Everything returned lives in the arena, so freeing it frees it all. If the
+arena runs out, the unit comes back marked `oom` with whatever was
 finished.
+
+### Convenience helpers
+
+Common questions take a line or two. They accept null where a node,
+symbol or type may be missing, and strings they return are
+null-terminated.
+
+| Question | Helper |
+| --- | --- |
+| Step through symbols of some kinds, filtered | `cp_nextsym(u, prev, CP_KIND(CP_SYM_FUNC), CP_SEL_MAIN\|CP_SEL_DEFINED)` |
+| Look up by name | `cp_findsym`, `cp_findtag`, `cp_macrodef` |
+| Where something is, what it says | `cp_locof`, `cp_locstr`, `cp_symloc`, `cp_srcof`, `cp_docof`, `cp_symdoc` |
+| From a header or a macro? | `cp_inmainfile`, `cp_macroof` |
+| Declarations and code as C | `cp_declstr(&a, u, t, name)`, `cp_signature`, `cp_nodestr`, `cp_typename` |
+| Struct fields with offsets and bit positions | `cp_fields` (anonymous members flattened) |
+| Enum constants and values | `cp_enumconsts` |
+| Walk the tree | `cp_walk(root, visitor, ctx)`, `cp_walkunit` |
+| Calls | `cp_callsto(u, "malloc")` (each call and its caller), `cp_callee` |
+| Type questions | `cp_typeis(t, CP_IS_INTEGER\|CP_IS_UNSIGNED)`, `cp_strip`, `cp_target` |
+| Constant values, diagnostics | `cp_constint`, `cp_errorstr` |
+
+`examples/` has short programs built on them: `functions.c` (functions
+with signatures and doc comments), `calls.c` (every call to a function),
+`structs.c` (layouts with padding) and `unused.c` (unused static
+functions, variables and macros). Build one with
+`cc -o calls examples/calls.c`.
 
 ## How it is tested
 
@@ -231,6 +278,16 @@ compiler is missing skip themselves. `tests/run.sh full` adds the corpus.
 
   It runs against gcc by default and against any other compiler with
   `CC=clang tests/corpus.sh`.
+- **Real projects** (`tests/wild.sh LIST DIR`): downloads GitHub projects
+  one at a time (C files only), checks every `.c` file with
+  `tests/wild1.sh`, and deletes each project that passes, so disk use stays
+  small. No build system is run; include paths are guessed from the
+  layout. A file the compiler accepts gets all four corpus checks; one it
+  rejects (usually for a missing generated header) must still not crash
+  or hang cparse. The 1.0 run covered 215 projects (Linux-adjacent tools,
+  compilers, interpreters, emulators, embedded SDKs, game libraries and
+  more): 125,480 files, with no crashes or hangs, and every failure it
+  found has been fixed or traced to the harness.
 - **System headers** (`tests/headers.sh`): every header under
   `/usr/include` that gcc accepts on its own (about 6,800) parses and
   roundtrips.
@@ -249,6 +306,9 @@ compiler is missing skip themselves. `tests/run.sh full` adds the corpus.
   code with missing headers must parse cleanly and roundtrip.
 - **Symbols** (`tests/cases/symbols.c`): uses and the call graph against
   hand-checked expected output.
+- **Helpers** (`tests/api.c`): every convenience and hosted helper against
+  `tests/cases/api_input.c`, built as strict C99 and under ASan and UBSan.
+  The programs in `examples/` are built and run too.
 - **AFL++** (`fuzz/`): a persistent-mode harness under ASan and UBSan,
   across all three target models and with trigraphs on and off. It checks
   for crashes and that every error-free input prints to a fixed point. Run
@@ -269,8 +329,11 @@ compiler is missing skip themselves. `tests/run.sh full` adds the corpus.
   differently.
 - Bit-fields wider than `int` keep their declared type in arithmetic. GCC
   gives them internal types that C cannot spell.
-- Integer constant arithmetic uses 64 bits; `__int128` constants
-  saturate.
+- Integer constants are held in 64 bits. A 128-bit constant expression
+  whose value does not fit is left unfolded rather than given a wrong
+  value.
+- `__TIMESTAMP__` is the configured time; GCC uses the file's
+  modification time.
 - `#if` treats `__has_attribute` as true for any name.
 - Guesses for missing headers can be ambiguous: in `int X y;` with both
   names unknown, `y` is taken for the annotation.

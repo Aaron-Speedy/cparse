@@ -111,3 +111,42 @@ int ok4;
 #if #cpu(x86_64) && #machine && #system(unix) && #system(posix)
 int predefined_asserts;
 #endif
+
+/* gcc's limits.h re-enters itself for its #else branch, which reaches
+ * glibc's limits.h: not an include guard */
+#include <limits.h>
+limits_ok PATH_MAX NGROUPS_MAX CHAR_BIT
+
+/* #import includes a file at most once, and one file reached by two
+ * spellings is one file for #pragma once */
+#import "include/import.h"
+#import "include/../include/import.h"
+#include "include/once.h"
+#include "./include/../include/once.h"
+
+/* a _Pragma whose operand comes out of a macro */
+#define pp_str_(x) #x
+#define pp_str(x) pp_str_(x)
+#define PP_IGNORE(w) _Pragma(pp_str(GCC diagnostic ignored w))
+PP_IGNORE("-Wsign-compare") after_pragma_operand
+
+/* #line in a skipped group is not applied; an active one is */
+#if 0
+#line 9000 "skipped.c"
+#endif
+line_after_skipped __LINE__
+#line 500 "renamed.c"
+line_after_active __LINE__ __FILE__
+
+/* __has_include with a macro operand; #pragma once across ../ spellings */
+#define PP_INC_NAME "include/once.h"
+#if __has_include(PP_INC_NAME)
+has_include_macro_ok
+#endif
+#include "../cases/include/once.h"
+
+/* #line with a macro operand; a lone carriage return ends a line */
+#define PP_LINE_NO 500
+#line PP_LINE_NO
+int pp_line_a = __LINE__;
+int pp_cr_a = 1;int pp_cr_b = __LINE__;

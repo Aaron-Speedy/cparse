@@ -37,6 +37,7 @@
 // This is free and unencumbered software released into the public domain.
 #define _XOPEN_SOURCE 700  // POSIX 2008 plus realpath
 #define CPARSE_IMPLEMENTATION
+#define CPARSE_HOSTED
 #include "cparse.h"
 
 #include <stdio.h>
@@ -71,28 +72,10 @@ static void *alloc(cp_arena *a, ptrdiff_t size)
     return r;
 }
 
-static Str copystr(cp_arena *a, Str s)
-{
-    Str r = {alloc(a, s.len+1), s.len};
-    if (s.len) memcpy(r.data, s.data, (size_t)s.len);
-    r.data[s.len] = 0;
-    return r;
-}
-
-static Str concat(cp_arena *a, Str x, Str y)
-{
-    Str r = {alloc(a, x.len+y.len+1), x.len+y.len};
-    if (x.len) memcpy(r.data, x.data, (size_t)x.len);
-    if (y.len) memcpy(r.data+x.len, y.data, (size_t)y.len);
-    r.data[r.len] = 0;
-    return r;
-}
-
 // --- output
 
 static void out(Str s)  { if (s.len) fwrite(s.data, 1, (size_t)s.len, stdout); }
 static void outs(char *s) { fputs(s, stdout); }
-static void outn(long long v) { printf("%lld", v); }
 
 static void outjson(Str s)
 {
@@ -113,51 +96,6 @@ static void outjson(Str s)
     putchar('"');
 }
 
-// --- files
-
-static Str readfile(void *ctx, Str path, cp_arena *a)
-{
-    (void)ctx;
-    Str r = {0};
-    char buf[4096];
-    if (path.len >= countof(buf)) return r;
-    memcpy(buf, path.data, (size_t)path.len);
-    buf[path.len] = 0;
-    FILE *f = fopen(buf, "rb");
-    if (!f) return r;
-    if (fseek(f, 0, SEEK_END) || ftell(f) < 0) { fclose(f); return r; }
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    ptrdiff_t avail = a->end - a->beg - 1;
-    if (n > avail) { fclose(f); return r; }
-    r.data = a->beg;
-    r.len = (ptrdiff_t)fread(r.data, 1, (size_t)n, f);
-    fclose(f);
-    // a directory opens but reads nothing on some systems; treat as absent
-    if (r.len != n) { r.data = 0; r.len = 0; return r; }
-    r.data[r.len] = 0;
-    a->beg += r.len + 1;
-    return r;
-}
-
-static Str runcommand(cp_arena *a, char *cmd)
-{
-    Str r = {0};
-    FILE *f = popen(cmd, "r");
-    if (!f) return r;
-    r.data = a->beg;
-    ptrdiff_t cap = a->end - a->beg - 1;
-    for (;;) {
-        size_t n = fread(r.data + r.len, 1, (size_t)(cap - r.len), f);
-        if (!n) break;
-        r.len += (ptrdiff_t)n;
-    }
-    pclose(f);
-    r.data[r.len] = 0;
-    a->beg += r.len + 1;
-    return r;
-}
-
 typedef struct {
     Str      *data;
     ptrdiff_t len;
@@ -174,63 +112,6 @@ static void push(cp_arena *a, Strs *s, Str v)
         s->cap = cap;
     }
     s->data[s->len++] = v;
-}
-
-// Ask the system compiler for its search path and predefined macros.
-static void querycc(cp_arena *a, char *cc, char *std, Strs *sysdirs, Str *predefs)
-{
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "%s %s -dM -E -x c /dev/null 2>/dev/null", cc, std ? std : "");
-    *predefs = runcommand(a, cmd);
-    snprintf(cmd, sizeof(cmd), "%s %s -E -v -x c /dev/null 2>&1 >/dev/null", cc, std ? std : "");
-    Str v = runcommand(a, cmd);
-    // lines between "#include <...> search starts here:" and "End of search list."
-    int in = 0;
-    char *p = v.data, *e = v.data + v.len;
-    while (p < e) {
-        char *nl = memchr(p, '\n', (size_t)(e - p));
-        if (!nl) nl = e;
-        Str line = {p, nl - p};
-        if (line.len >= 7 && !memcmp(line.data, "#include <", 10 < line.len ? 10 : (size_t)line.len)) {
-            in = 1;
-        } else if (line.len >= 3 && !memcmp(line.data, "End", 3)) {
-            in = 0;
-        } else if (in && line.len > 1 && line.data[0] == ' ') {
-            Str d = {line.data+1, line.len-1};
-            // drop " (framework directory)" suffixes
-            for (ptrdiff_t i = 0; i < d.len; i++) {
-                if (d.data[i] == ' ') { d.len = i; break; }
-            }
-            push(a, sysdirs, copystr(a, d));
-        }
-        p = nl + 1;
-    }
-}
-
-// Does the "cc -dM" output define name?
-static int hasdefine(Str predefs, char *name)
-{
-    size_t n = strlen(name);
-    for (char *p = predefs.data, *e = p + predefs.len; p+8+n < e; p++) {
-        if (!memcmp(p, "#define ", 8) && !memcmp(p+8, name, n) && p[8+n] == ' ') return 1;
-    }
-    return 0;
-}
-
-// GCC's predefined assertions (#cpu, #machine, #system), which "cc -dM"
-// cannot report, rebuilt from the macros that imply them.
-static Str ccasserts(cp_arena *a, Str predefs)
-{
-    Str r = {0};
-    if (hasdefine(predefs, "__x86_64__")) {
-        r = concat(a, r, S("#assert cpu(x86_64)\n#assert machine(x86_64)\n"));
-    } else if (hasdefine(predefs, "__i386__")) {
-        r = concat(a, r, S("#assert cpu(i386)\n#assert machine(i386)\n"));
-    }
-    if (hasdefine(predefs, "__linux__")) {
-        r = concat(a, r, S("#assert system(linux)\n#assert system(unix)\n#assert system(posix)\n"));
-    }
-    return r;
 }
 
 // --- locations
@@ -832,6 +713,42 @@ static int nameable(Str s)
     return 1;
 }
 
+// Does a type contain a function reached through a noreturn pointer,
+// which GCC types as a variant C cannot spell?
+static int noreturnfn(cp_type *t, int depth)
+{
+    for (; t && depth < 32; t = t->base, depth++) {
+        if (t->kind != CP_T_FUNC) continue;
+        if (t->flags & (CP_TF_NORETURN|CP_TF_ABI)) return 1;
+        for (int32_t i = 0; i < t->nargs; i++) {
+            if (noreturnfn(t->args[i], depth+1)) return 1;
+        }
+    }
+    return 0;
+}
+
+// Does a type mention a tag declared only in a parameter list (a warning
+// in C)? Code outside cannot name that type.
+static int prototag(cp_type *t, int depth)
+{
+    for (; t && depth < 32; t = t->base, depth++) {
+        if ((t->unqual ? t->unqual : t)->flags & CP_TF_PROTOTAG) return 1;
+        if (t->kind != CP_T_FUNC) continue;
+        for (int32_t i = 0; i < t->nargs; i++) {
+            if (prototag(t->args[i], depth+1)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int isclang(cp_unit *u)
+{
+    for (cp_macro *m = u->macros; m; m = m->next) {
+        if (equals(m->name, S("__clang__"))) return 1;
+    }
+    return 0;
+}
+
 static void modetypecheck(cp_arena *a, cp_unit *u, Str printed)
 {
     out(printed);
@@ -866,6 +783,11 @@ static void modetypecheck(cp_arena *a, cp_unit *u, Str printed)
         }
         if (s->kind != CP_SYM_VAR && s->kind != CP_SYM_FUNC && s->kind != CP_SYM_TYPEDEF &&
             s->kind != CP_SYM_ENUMCONST) continue;
+        if (noreturnfn(s->ty, 0)) continue;  // GCC's own variant type
+        if (prototag(s->ty, 0)) continue;  // a tag local to a prototype
+        if (s->kind == CP_SYM_FUNC && isclang(u) && equals(cstr("_mm_"), (Str){s->name.data, s->name.len < 4 ? s->name.len : 4})) {
+            continue;  // Clang's library builtins refuse typeof
+        }
         Str t = tname(&scratch, u, s->ty);
         if (!nameable(t)) continue;
         if (s->kind == CP_SYM_TYPEDEF) {
@@ -894,8 +816,7 @@ static int roundtrip(cp_arena *a, cp_unit *u, Str name, cp_config *cfg, int verb
     Str p1 = cp_print(a, u);
     if (!p1.data) { fprintf(stderr, "roundtrip: out of memory printing\n"); return 1; }
     cp_config c2 = cfg ? *cfg : (cp_config){0};
-    c2.nopp = 1;
-    c2.predefs = S("");
+    c2.nopp = 1;  // keeps the predefs: they say the C version and target
     cp_unit *u2 = cp_parse(a, p1, name, &c2);
     if (!u2) { fprintf(stderr, "roundtrip: out of memory\n"); return 1; }
     Str p2 = cp_print(a, u2);
@@ -976,6 +897,7 @@ int main(void)
                     cp_config c2 = {0};
                     c2.nopp = 1;
                     c2.target = cfg.target;
+                    c2.predefs = cfg.predefs;
                     cp_unit *u2 = cp_parse(&a, p1, S("fuzz.c"), &c2);
                     if (u2 && !u2->oom) {
                         Str p2 = cp_print(&a, u2);
@@ -1024,100 +946,41 @@ int main(int argc, char **argv)
     }
     cp_arena perm = {mem, mem + cap};
 
-    Strs quote = {0}, inc = {0}, sys = {0}, files = {0};
-    Str defines = {0};
+    Strs files = {0};
     char *mode = "--check";
-    char *cc = "cc";
-    char *std = 0;
     Str xref = {0};
-    int dot = 0, all = 0, nostdinc = 0;
-    cp_config cfg = {0};
-    cfg.readfile = readfile;
-
+    int dot = 0, all = 0;
     for (int i = 1; i < argc; i++) {
         char *a = argv[i];
         Str next = i+1 < argc ? cstr(argv[i+1]) : (Str){0};
-        if (!strcmp(a, "-I") && next.data) { push(&perm, &inc, next); i++; }
-        else if (!strncmp(a, "-I", 2) && a[2]) push(&perm, &inc, cstr(a+2));
-        else if (!strcmp(a, "-isystem") && next.data) { push(&perm, &sys, next); i++; }
-        else if (!strcmp(a, "-iquote") && next.data) { push(&perm, &quote, next); i++; }
-        else if (!strncmp(a, "-D", 2)) {
-            char *d = a[2] ? a+2 : (i+1 < argc ? argv[++i] : "");
-            char *eq = strchr(d, '=');
-            Str line = S("#define ");
-            if (eq) {
-                line = concat(&perm, line, (Str){d, eq - d});
-                line = concat(&perm, line, S(" "));
-                line = concat(&perm, line, cstr(eq+1));
-            } else {
-                line = concat(&perm, line, cstr(d));
-                line = concat(&perm, line, S(" 1"));
-            }
-            defines = concat(&perm, defines, concat(&perm, line, S("\n")));
-        } else if (!strncmp(a, "-U", 2)) {
-            char *d = a[2] ? a+2 : (i+1 < argc ? argv[++i] : "");
-            defines = concat(&perm, defines, concat(&perm, concat(&perm, S("#undef "), cstr(d)), S("\n")));
-        } else if (!strcmp(a, "--cc") && next.data) { cc = argv[++i]; }
-        else if (!strcmp(a, "--std") && next.data) {
-            std = (char *)concat(&perm, S("-std="), next).data;
-            i++;
-        } else if (!strncmp(a, "-std=", 5) || !strncmp(a, "-O", 2) || !strncmp(a, "-m", 2) ||
-                   (!strncmp(a, "-f", 2) && a[2])) {
-            // compiler flags that change predefined macros
-            Str prev = std ? cstr(std) : S("");
-            std = concat(&perm, concat(&perm, prev, S(" ")), cstr(a)).data;
-            if (!strncmp(a, "-std=", 5)) {
-                // ISO modes before C23 have trigraphs, GNU modes do not
-                char *v = a + 5;
-                cfg.trigraphs = (v[0] == 'c' && strncmp(v, "c2", 2)) ||
-                                (!strncmp(v, "iso9899:", 8) && strcmp(v, "iso9899:2024"));
-            }
-        } else if (!strcmp(a, "-trigraphs")) { cfg.trigraphs = 1; }
-        else if (!strcmp(a, "--target") && next.data) {
-            i++;
-            if (equals(next, S("llp64"))) cfg.target = CP_TARGET_LLP64;
-            else if (equals(next, S("ilp32"))) cfg.target = CP_TARGET_ILP32;
-            else cfg.target = CP_TARGET_LP64;
-        } else if (!strcmp(a, "--nopp")) { cfg.nopp = 1; }
-        else if (!strcmp(a, "--nostdinc") || !strcmp(a, "-nostdinc")) { nostdinc = 1; }
+        // options with a value: compiler ones are cp_hostconfig's
+        static char *const valued[] = {
+            "-I", "-isystem", "-iquote", "-D", "-U", "-include", "--cc", "--std",
+            "--target", "-o", "-x",
+        };
+        int skip = 0;
+        for (int k = 0; k < countof(valued); k++) skip |= !strcmp(a, valued[k]);
+        if (skip) { i++; continue; }
+        if (!strcmp(a, "--xref") && next.data) { mode = a; xref = next; i++; }
         else if (!strcmp(a, "--dot")) { dot = 1; }
         else if (!strcmp(a, "--all")) { all = 1; }
-        else if (!strcmp(a, "--xref") && next.data) { mode = a; xref = next; i++; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "--version")) { puts("cparse " CPARSE_VERSION); return 0; }
-        else if ((a[0] == '-' && a[1] == '-') || !strcmp(a, "-E")) { mode = a; }
-        else if (!strcmp(a, "-include") && next.data) {
-            // as if the main file began with #include "FILE"
-            char *full = realpath(argv[++i], 0);
-            Str path = full ? cstr(full) : next;
-            defines = concat(&perm, defines, S("#include \""));
-            defines = concat(&perm, defines, copystr(&perm, path));
-            defines = concat(&perm, defines, S("\"\n"));
-            free(full);
-        }
-        else if (!strcmp(a, "-o") || !strcmp(a, "-x")) { i++; }
-        else if (a[0] == '-' && a[1]) { /* other compiler flags: ignored */ }
+        else if (a[0] == '-' && a[1] == '-' && strcmp(a, "--nopp") && strcmp(a, "--nostdinc")) { mode = a; }
+        else if (!strcmp(a, "-E")) { mode = a; }
+        else if (a[0] == '-' && a[1]) { /* compiler options: cp_hostconfig's */ }
         else push(&perm, &files, cstr(a));
     }
     if (!files.len) { usage(); return 1; }
-
-    Str predefs = {0};
-    if (!cfg.nopp && strcmp(cc, "none")) {
-        Strs ccdirs = {0};
-        querycc(&perm, cc, std, &ccdirs, &predefs);
-        predefs = concat(&perm, predefs, ccasserts(&perm, predefs));
-        for (ptrdiff_t i = 0; !nostdinc && i < ccdirs.len; i++) push(&perm, &sys, ccdirs.data[i]);
-    }
-    cfg.predefs = concat(&perm, predefs, defines);
-    cfg.quotedirs = quote.data; cfg.nquotedirs = (int32_t)quote.len;
-    cfg.includedirs = inc.data; cfg.nincludedirs = (int32_t)inc.len;
-    cfg.systemdirs = sys.data; cfg.nsystemdirs = (int32_t)sys.len;
+    cp_config *cfgp = cp_hostconfig(&perm, argc-1, argv+1);
+    if (!cfgp) { fputs("cparse: out of memory\n", stderr); return 2; }
+    cp_config cfg = *cfgp;
 
     int status = 0;
     for (ptrdiff_t f = 0; f < files.len; f++) {
         cp_arena a = perm;
         Str name = files.data[f];
-        Str src = equals(name, S("-")) ? (Str){0} : readfile(0, name, &a);
+        Str src = equals(name, S("-")) ? (Str){0} : cp_readfile(0, name, &a);
         if (equals(name, S("-"))) {
             src.data = a.beg;
             src.len = (ptrdiff_t)fread(src.data, 1, (size_t)(a.end - a.beg - 1), stdin);
